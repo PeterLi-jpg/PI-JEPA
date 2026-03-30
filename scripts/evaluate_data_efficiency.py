@@ -238,18 +238,22 @@ class DataEfficiencyEvaluator:
     def _limit_dataset(
         self,
         data_loader: DataLoader,
-        n_samples: int
+        n_samples: int,
+        seed: Optional[int] = None
     ) -> DataLoader:
         """
-        Limit dataset to n_samples with fixed seed.
+        Limit dataset to n_samples.
         
         Args:
             data_loader: Original data loader
             n_samples: Number of samples to use
+            seed: Random seed for shuffling (defaults to self.seed)
             
         Returns:
             New DataLoader with limited samples
         """
+        if seed is None:
+            seed = self.seed
         dataset = data_loader.dataset
         n_available = len(dataset)
         n_use = min(n_samples, n_available)
@@ -262,7 +266,7 @@ class DataEfficiencyEvaluator:
             subset,
             batch_size=min(self.batch_size, n_use),
             shuffle=True,
-            generator=torch.Generator().manual_seed(self.seed)
+            generator=torch.Generator().manual_seed(seed)
         )
     
     def _prepare_batch(
@@ -331,7 +335,8 @@ class DataEfficiencyEvaluator:
         encoder: nn.Module,
         train_loader: DataLoader,
         n_labeled: int,
-        full_finetune: bool = False
+        full_finetune: bool = False,
+        seed: Optional[int] = None
     ) -> nn.Module:
         """
         Finetune PI-JEPA on n_labeled samples.
@@ -382,7 +387,7 @@ class DataEfficiencyEvaluator:
         ).to(self.device)
         
         # Limit dataset
-        limited_loader = self._limit_dataset(train_loader, n_labeled)
+        limited_loader = self._limit_dataset(train_loader, n_labeled, seed=seed)
         
         # Optimizer - include encoder if full finetuning
         if full_finetune:
@@ -485,7 +490,8 @@ class DataEfficiencyEvaluator:
     def _train_pijepa_scratch(
         self,
         train_loader: DataLoader,
-        n_labeled: int
+        n_labeled: int,
+        seed: Optional[int] = None
     ) -> Tuple[nn.Module, nn.Module]:
         """
         Train PI-JEPA architecture from scratch (no pretraining).
@@ -523,7 +529,7 @@ class DataEfficiencyEvaluator:
         ).to(self.device)
         
         # Limit dataset
-        limited_loader = self._limit_dataset(train_loader, n_labeled)
+        limited_loader = self._limit_dataset(train_loader, n_labeled, seed=seed)
         
         # Optimizer for both encoder and prediction head
         optimizer = torch.optim.AdamW([
@@ -563,23 +569,14 @@ class DataEfficiencyEvaluator:
         self,
         model_wrapper: Any,
         train_loader: DataLoader,
-        n_labeled: int
+        n_labeled: int,
+        seed: Optional[int] = None
     ) -> None:
         """
         Train baseline model from scratch on n_labeled samples.
-        
-        Validates: AC 6.2 - Train baselines from scratch on same N_l labeled
-        
-        Args:
-            model_wrapper: Baseline model wrapper
-            train_loader: Training data loader
-            n_labeled: Number of labeled samples to use
         """
-        # Limit dataset
-        limited_loader = self._limit_dataset(train_loader, n_labeled)
-        
-        # Convert to dict format expected by benchmark wrappers
-        dict_loader = self._convert_to_dict_loader(limited_loader)
+        limited_loader = self._limit_dataset(train_loader, n_labeled, seed=seed)
+        dict_loader = self._convert_to_dict_loader(limited_loader, seed=seed)
         
         # Train model
         model_wrapper.train_model(
@@ -590,7 +587,8 @@ class DataEfficiencyEvaluator:
     
     def _convert_to_dict_loader(
         self,
-        data_loader: DataLoader
+        data_loader: DataLoader,
+        seed: Optional[int] = None
     ) -> DataLoader:
         """
         Convert data loader to dict format expected by benchmark wrappers.
@@ -627,7 +625,7 @@ class DataEfficiencyEvaluator:
             dict_dataset,
             batch_size=data_loader.batch_size,
             shuffle=True,
-            generator=torch.Generator().manual_seed(self.seed)
+            generator=torch.Generator().manual_seed(seed if seed is not None else self.seed)
         )
     
     def _evaluate_baseline(
@@ -792,11 +790,12 @@ class DataEfficiencyEvaluator:
             print("Training PI-JEPA (finetuning)...")
             pijepa_errors = []
             for s in range(n_seeds):
-                set_seed(self.seed + s)
+                run_seed = self.seed + s
+                set_seed(run_seed)
                 encoder_copy = copy.deepcopy(pretrained_encoder)
                 encoder_copy.to(self.device)
                 prediction_head = self._finetune_pijepa(
-                    encoder_copy, train_loader, n_labeled
+                    encoder_copy, train_loader, n_labeled, seed=run_seed
                 )
                 err = self._evaluate_pijepa(encoder_copy, prediction_head, test_loader)
                 pijepa_errors.append(err)
@@ -808,9 +807,10 @@ class DataEfficiencyEvaluator:
             print("Training PI-JEPA from scratch (no pretraining)...")
             scratch_errors = []
             for s in range(n_seeds):
-                set_seed(self.seed + s)
+                run_seed = self.seed + s
+                set_seed(run_seed)
                 scratch_encoder, scratch_head = self._train_pijepa_scratch(
-                    train_loader, n_labeled
+                    train_loader, n_labeled, seed=run_seed
                 )
                 err = self._evaluate_pijepa(scratch_encoder, scratch_head, test_loader)
                 scratch_errors.append(err)
@@ -826,7 +826,8 @@ class DataEfficiencyEvaluator:
                 
                 baseline_errors = []
                 for s in range(n_seeds):
-                    set_seed(self.seed + s)
+                    run_seed = self.seed + s
+                    set_seed(run_seed)
                     wrapper = self._create_fresh_baseline(baseline_name)
                     
                     if wrapper is None:
@@ -834,7 +835,7 @@ class DataEfficiencyEvaluator:
                         break
                     
                     try:
-                        self._train_baseline(wrapper, train_loader, n_labeled)
+                        self._train_baseline(wrapper, train_loader, n_labeled, seed=run_seed)
                         err = self._evaluate_baseline(wrapper, test_loader)
                         baseline_errors.append(err)
                     except Exception as e:
