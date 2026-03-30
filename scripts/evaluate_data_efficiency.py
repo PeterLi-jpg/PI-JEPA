@@ -37,6 +37,7 @@ from torch.utils.data import DataLoader, Subset, TensorDataset
 
 # Add PI-JEPA directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "PI-JEPA"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from models import ViTEncoder, PredictionHead, build_encoder
 from utils import load_config
@@ -172,54 +173,67 @@ class DataEfficiencyEvaluator:
             
             return train_loader, test_loader
         
-        # Fall back to neuralop
+        # Fall back to neuralop — generate 64x64 data if it doesn't exist
+        print(f"No generated data found at data/darcy/. Generating {resolution}x{resolution} Darcy data...")
+        
         try:
+            from generate_darcy_data import generate_dataset
+            import numpy as np
+            
+            os.makedirs(os.path.join("data", "darcy"), exist_ok=True)
+            
+            K_train, p_train = generate_dataset(
+                n_samples=n_train, resolution=resolution, seed=self.seed
+            )
+            K_test, p_test = generate_dataset(
+                n_samples=n_test, resolution=resolution, seed=self.seed + 1
+            )
+            
+            x_train = torch.from_numpy(K_train).float().unsqueeze(1)
+            y_train = torch.from_numpy(p_train).float().unsqueeze(1)
+            x_test = torch.from_numpy(K_test).float().unsqueeze(1)
+            y_test = torch.from_numpy(p_test).float().unsqueeze(1)
+            
+            # Save for future runs
+            torch.save({'x': x_train, 'y': y_train, 'resolution': resolution, 'n_samples': n_train},
+                       generated_train)
+            torch.save({'x': x_test, 'y': y_test, 'resolution': resolution, 'n_samples': n_test},
+                       generated_test)
+            print(f"  Generated and saved {resolution}x{resolution} data")
+            print(f"  Train: {x_train.shape}, Test: {x_test.shape}")
+            
+        except Exception as e:
+            print(f"  Data generation failed ({e}), falling back to neuralop 16x16 data")
             try:
                 from neuralop.data.datasets import load_darcy_flow_small
             except ImportError:
                 from neuralop.datasets import load_darcy_flow_small
-        
+            
             train_loader, test_loaders, _ = load_darcy_flow_small(
                 n_train=n_train,
                 n_tests=[n_test],
                 batch_size=self.batch_size,
                 test_batch_sizes=[self.batch_size],
             )
-            
-            # test_loaders is a dict keyed by resolution, get the first one
             test_loader = list(test_loaders.values())[0]
-            
             return train_loader, test_loader
-            
-        except ImportError:
-            # Fallback: create synthetic data for testing
-            print("Warning: neuralop not available, using synthetic data")
-            
-            # Create synthetic data with fixed seed
-            torch.manual_seed(self.seed)
-            
-            x_train = torch.randn(n_train, 1, resolution, resolution)
-            y_train = torch.randn(n_train, 1, resolution, resolution)
-            
-            x_test = torch.randn(n_test, 1, resolution, resolution)
-            y_test = torch.randn(n_test, 1, resolution, resolution)
-            
-            train_dataset = TensorDataset(x_train, y_train)
-            test_dataset = TensorDataset(x_test, y_test)
-            
-            train_loader = DataLoader(
-                train_dataset,
-                batch_size=self.batch_size,
-                shuffle=True,
-                generator=torch.Generator().manual_seed(self.seed)
-            )
-            test_loader = DataLoader(
-                test_dataset,
-                batch_size=self.batch_size,
-                shuffle=False
-            )
-            
-            return train_loader, test_loader
+        
+        train_dataset = TensorDataset(x_train, y_train)
+        test_dataset = TensorDataset(x_test, y_test)
+        
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            generator=torch.Generator().manual_seed(self.seed)
+        )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=self.batch_size,
+            shuffle=False
+        )
+        
+        return train_loader, test_loader
     
     def _limit_dataset(
         self,

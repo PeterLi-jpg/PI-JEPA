@@ -45,6 +45,7 @@ import torch
 
 # Add PI-JEPA directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "PI-JEPA"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from utils import load_config
 
@@ -637,6 +638,40 @@ def run_full_pipeline(
         'output_dir': output_dir,
         'timestamp': datetime.now().isoformat()
     }
+    
+    # Phase 0: Ensure 64x64 Darcy data exists
+    generated_train = os.path.join("data", "darcy", "darcy_train.pt")
+    generated_test = os.path.join("data", "darcy", "darcy_test.pt")
+    
+    if not (os.path.exists(generated_train) and os.path.exists(generated_test)):
+        print("\nGenerating 64x64 Darcy flow dataset...")
+        from generate_darcy_data import generate_dataset
+        import numpy as np
+        
+        cfg = load_config(config_path)
+        resolution = cfg.get("data", {}).get("grid_size", 64)
+        seed = cfg.get("experiment", {}).get("seed", 42)
+        
+        os.makedirs(os.path.join("data", "darcy"), exist_ok=True)
+        
+        K_train, p_train = generate_dataset(n_samples=1000, resolution=resolution, seed=seed)
+        K_test, p_test = generate_dataset(n_samples=200, resolution=resolution, seed=seed + 1)
+        
+        torch.save(
+            {'x': torch.from_numpy(K_train).float().unsqueeze(1),
+             'y': torch.from_numpy(p_train).float().unsqueeze(1),
+             'resolution': resolution, 'n_samples': 1000},
+            generated_train
+        )
+        torch.save(
+            {'x': torch.from_numpy(K_test).float().unsqueeze(1),
+             'y': torch.from_numpy(p_test).float().unsqueeze(1),
+             'resolution': resolution, 'n_samples': 200},
+            generated_test
+        )
+        print(f"  Saved {resolution}x{resolution} data to data/darcy/")
+    else:
+        print(f"\nUsing existing 64x64 data at {generated_train}")
     
     # Phase 1: Pretraining
     if pretrain_checkpoint and os.path.exists(pretrain_checkpoint):
