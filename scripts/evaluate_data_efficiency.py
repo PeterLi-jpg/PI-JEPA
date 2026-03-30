@@ -397,6 +397,11 @@ class DataEfficiencyEvaluator:
                 lr=self.finetune_lr
             )
         
+        # LR scheduler — cosine decay helps pretrained encoder finetuning
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=self.finetune_epochs, eta_min=1e-6
+        )
+        
         # Training loop
         prediction_head.train()
         
@@ -430,6 +435,8 @@ class DataEfficiencyEvaluator:
                 
                 epoch_loss += loss.item()
                 n_batches += 1
+            
+            scheduler.step()
             
             if (epoch + 1) % 20 == 0 or epoch == 0:
                 avg_loss = epoch_loss / max(n_batches, 1)
@@ -772,72 +779,71 @@ class DataEfficiencyEvaluator:
         for baseline in baselines_to_run:
             results[baseline] = {}
         
+        # Number of seeds to average over for robust results
+        n_seeds = 3
+        
         # Run comparison for each n_labeled
         for n_labeled in n_labeled_sweep:
             print(f"\n{'-'*40}")
             print(f"N_labeled = {n_labeled}")
             print(f"{'-'*40}")
             
-            # Reset seed for each n_labeled to ensure reproducibility
-            set_seed(self.seed)
-            
-            # 1. Finetune and evaluate PI-JEPA (AC 6.1)
+            # 1. Finetune and evaluate PI-JEPA (AC 6.1) — average over seeds
             print("Training PI-JEPA (finetuning)...")
-            
-            # Create a fresh copy of encoder for finetuning
-            encoder_copy = copy.deepcopy(pretrained_encoder)
-            encoder_copy.to(self.device)
-            
-            prediction_head = self._finetune_pijepa(
-                encoder_copy,
-                train_loader,
-                n_labeled
-            )
-            pijepa_error = self._evaluate_pijepa(
-                encoder_copy,
-                prediction_head,
-                test_loader
-            )
+            pijepa_errors = []
+            for s in range(n_seeds):
+                set_seed(self.seed + s)
+                encoder_copy = copy.deepcopy(pretrained_encoder)
+                encoder_copy.to(self.device)
+                prediction_head = self._finetune_pijepa(
+                    encoder_copy, train_loader, n_labeled
+                )
+                err = self._evaluate_pijepa(encoder_copy, prediction_head, test_loader)
+                pijepa_errors.append(err)
+            pijepa_error = sum(pijepa_errors) / len(pijepa_errors)
             results["pi_jepa"][n_labeled] = pijepa_error
-            print(f"  PI-JEPA relative L2 error: {pijepa_error:.6f}")
+            print(f"  PI-JEPA relative L2 error: {pijepa_error:.6f} (seeds: {[f'{e:.4f}' for e in pijepa_errors]})")
             
-            # 2. Train PI-JEPA from scratch (no pretraining) for comparison
+            # 2. Train PI-JEPA from scratch — average over seeds
             print("Training PI-JEPA from scratch (no pretraining)...")
-            set_seed(self.seed)
-            
-            scratch_encoder, scratch_head = self._train_pijepa_scratch(
-                train_loader,
-                n_labeled
-            )
-            scratch_error = self._evaluate_pijepa(
-                scratch_encoder,
-                scratch_head,
-                test_loader
-            )
+            scratch_errors = []
+            for s in range(n_seeds):
+                set_seed(self.seed + s)
+                scratch_encoder, scratch_head = self._train_pijepa_scratch(
+                    train_loader, n_labeled
+                )
+                err = self._evaluate_pijepa(scratch_encoder, scratch_head, test_loader)
+                scratch_errors.append(err)
+            scratch_error = sum(scratch_errors) / len(scratch_errors)
             if "pi_jepa_scratch" not in results:
                 results["pi_jepa_scratch"] = {}
             results["pi_jepa_scratch"][n_labeled] = scratch_error
             print(f"  PI-JEPA (scratch) relative L2 error: {scratch_error:.6f}")
             
-            # 3. Train and evaluate baselines from scratch (AC 6.2)
+            # 3. Train and evaluate baselines — average over seeds
             for baseline_name in baselines_to_run:
                 print(f"Training {baseline_name} from scratch...")
-                set_seed(self.seed)  # Reset seed for fair comparison
                 
-                # Create fresh model for each N_l
-                wrapper = self._create_fresh_baseline(baseline_name)
+                baseline_errors = []
+                for s in range(n_seeds):
+                    set_seed(self.seed + s)
+                    wrapper = self._create_fresh_baseline(baseline_name)
+                    
+                    if wrapper is None:
+                        print(f"  Skipping {baseline_name} (not available)")
+                        break
+                    
+                    try:
+                        self._train_baseline(wrapper, train_loader, n_labeled)
+                        err = self._evaluate_baseline(wrapper, test_loader)
+                        baseline_errors.append(err)
+                    except Exception as e:
+                        print(f"  Error training {baseline_name} (seed {s}): {e}")
                 
-                if wrapper is None:
-                    print(f"  Skipping {baseline_name} (not available)")
-                    continue
-                
-                try:
-                    self._train_baseline(wrapper, train_loader, n_labeled)
-                    error = self._evaluate_baseline(wrapper, test_loader)
-                    results[baseline_name][n_labeled] = error
-                    print(f"  {baseline_name} relative L2 error: {error:.6f}")
-                except Exception as e:
-                    print(f"  Error training {baseline_name}: {e}")
+                if baseline_errors:
+                    avg_error = sum(baseline_errors) / len(baseline_errors)
+                    results[baseline_name][n_labeled] = avg_error
+                    print(f"  {baseline_name} relative L2 error: {avg_error:.6f} (seeds: {[f'{e:.4f}' for e in baseline_errors]})")
         
         # Remove empty results (models that weren't available)
         results = {k: v for k, v in results.items() if v}

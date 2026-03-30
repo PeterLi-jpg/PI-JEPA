@@ -267,7 +267,7 @@ pretraining:
 # Uses limited labeled (x, y) pairs for data efficiency evaluation.
 finetuning:
   enabled: true
-  epochs: 200  # More epochs for better convergence with limited data
+  epochs: 300  # More epochs — head is lightweight, encoder needs time to adapt
   batch_size: 32
   
   # Labeled data settings
@@ -279,18 +279,18 @@ finetuning:
   
   # Prediction head settings
   prediction_head:
-    hidden_dim: 768  # Increased from 512
+    hidden_dim: 768
     output_channels: 1
   
-  # Optimizer (only for prediction head when encoder frozen)
+  # Optimizer
   optim:
-    lr: 5e-4  # Moderate LR for prediction head
+    lr: 5e-4  # Head LR
     weight_decay: 1e-4
   
   # Full finetuning option (unfreeze encoder)
   full_finetune:
-    enabled: true  # Enable full finetuning to adapt encoder to downstream task
-    encoder_lr_multiplier: 0.05  # Conservative LR for pretrained encoder
+    enabled: true
+    encoder_lr_multiplier: 0.2  # Higher encoder LR to leverage pretrained features
   
   # Checkpointing
   checkpoint:
