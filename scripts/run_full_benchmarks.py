@@ -426,7 +426,8 @@ def load_pretrained_encoder(checkpoint_path, config, device):
 def main():
     parser = argparse.ArgumentParser(description="Full PI-JEPA benchmark suite")
     parser.add_argument("--config", default="configs/darcy.yaml")
-    parser.add_argument("--checkpoint", required=True, help="Pretrained encoder checkpoint")
+    parser.add_argument("--checkpoint", default=None,
+                        help="Pretrained encoder checkpoint (will pretrain if not provided)")
     parser.add_argument("--output", default="outputs/full_benchmarks")
     parser.add_argument("--benchmarks", nargs="+",
                         default=["darcy", "twophase", "adr"],
@@ -442,8 +443,30 @@ def main():
     print(f"Benchmarks: {args.benchmarks}")
     print(f"Started: {datetime.now()}")
 
+    # Ensure Darcy data exists (needed for pretraining regardless)
+    ensure_darcy_data()
+
+    # Load or run pretraining
+    checkpoint_path = args.checkpoint
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        print(f"Using existing checkpoint: {checkpoint_path}")
+    else:
+        # Run pretraining
+        pretrain_dir = os.path.join(args.output, "pretrain")
+        os.makedirs(pretrain_dir, exist_ok=True)
+        default_ckpt = os.path.join(pretrain_dir, "checkpoint_best.pt")
+
+        if os.path.exists(default_ckpt):
+            print(f"Found existing checkpoint: {default_ckpt}")
+            checkpoint_path = default_ckpt
+        else:
+            print("\nNo checkpoint found — running pretraining...")
+            from pretrain import pretrain
+            checkpoint_path = pretrain(args.config, pretrain_dir)
+            print(f"Pretraining complete: {checkpoint_path}")
+
     # Load pretrained encoder
-    encoder = load_pretrained_encoder(args.checkpoint, config, device)
+    encoder = load_pretrained_encoder(checkpoint_path, config, device)
 
     all_results = {}
 
