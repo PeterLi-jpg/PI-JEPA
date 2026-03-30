@@ -106,9 +106,9 @@ class DataEfficiencyEvaluator:
         self.finetune_lr = float(finetuning_cfg.get("optim", {}).get("lr", 1e-3))
         self.batch_size = finetuning_cfg.get("batch_size", 32)
         
-        # Baseline training parameters
+        # Baseline training parameters — match finetuning epochs for fair comparison
         self.baseline_epochs = config.get("evaluation", {}).get(
-            "baseline_epochs", 100
+            "baseline_epochs", self.finetune_epochs
         )
         self.baseline_lr = config.get("evaluation", {}).get(
             "baseline_lr", 1e-3
@@ -397,8 +397,11 @@ class DataEfficiencyEvaluator:
                 
                 optimizer.zero_grad()
                 
-                with torch.no_grad():
+                if full_finetune:
                     z = encoder(x)
+                else:
+                    with torch.no_grad():
+                        z = encoder(x)
                 
                 if first_batch:
                     print(f"  [PI-JEPA] Input shape: {x.shape}, Target shape: {y.shape}")

@@ -365,48 +365,54 @@ class SelfSupervisedPretrainer:
         coefficient_field: torch.Tensor
     ) -> torch.Tensor:
         """
-        Compute physics residual on decoded coefficient field.
-        
-        For pretraining, we enforce consistency between decoded and
-        original coefficient field, plus smoothness constraints.
-        
+        Compute Darcy PDE residual: -∇·(K ∇p) ≈ 0.
+
+        The decoder output is treated as a candidate pressure field p.
+        The coefficient field is the permeability K.  Penalising the
+        residual forces the latent space to encode information that is
+        physically consistent with the governing PDE.
+
         Args:
-            z_decoded: (B, C, H, W) decoded latent representation
-            coefficient_field: (B, 1, H, W) original coefficient field
-            
+            z_decoded: (B, C, H, W) decoded field — treated as pressure p
+            coefficient_field: (B, 1, H, W) permeability K
+
         Returns:
             Scalar physics residual loss
         """
-        # Reconstruction consistency
-        # Take first channel if decoder outputs multiple channels
-        if z_decoded.shape[1] > 1:
-            z_decoded_coeff = z_decoded[:, 0:1]
-        else:
-            z_decoded_coeff = z_decoded
-        
-        # Interpolate decoded output to match input resolution if needed
-        if z_decoded_coeff.shape[-2:] != coefficient_field.shape[-2:]:
-            z_decoded_coeff = F.interpolate(
-                z_decoded_coeff, 
-                size=coefficient_field.shape[-2:], 
-                mode='bilinear', 
-                align_corners=False
+        from physics.darcy import grad_x, grad_y, divergence
+
+        # Use first channel of decoded output as pressure
+        p = z_decoded[:, 0:1]
+
+        # Match spatial resolution
+        if p.shape[-2:] != coefficient_field.shape[-2:]:
+            p = F.interpolate(
+                p, size=coefficient_field.shape[-2:],
+                mode='bilinear', align_corners=False
             )
-        
-        recon_loss = F.mse_loss(z_decoded_coeff, coefficient_field)
-        
-        # Smoothness constraint (Laplacian regularization)
-        # Encourages smooth coefficient fields
-        laplacian_kernel = torch.tensor([
-            [0, 1, 0],
-            [1, -4, 1],
-            [0, 1, 0]
-        ], dtype=z_decoded_coeff.dtype, device=z_decoded_coeff.device).view(1, 1, 3, 3)
-        
-        laplacian = F.conv2d(z_decoded_coeff, laplacian_kernel, padding=1)
-        smoothness_loss = (laplacian ** 2).mean()
-        
-        return recon_loss + 0.01 * smoothness_loss
+
+        K = coefficient_field  # (B, 1, H, W)
+
+        physics_cfg = self.config.get("physics", {})
+        dx = float(physics_cfg.get("dx", 1.0))
+        dy = float(physics_cfg.get("dy", 1.0))
+
+        # Darcy flux: q = -K ∇p
+        dp_dx = grad_x(p, dx)
+        dp_dy = grad_y(p, dy)
+
+        flux_x = -K * dp_dx
+        flux_y = -K * dp_dy
+
+        # Residual: -∇·(K ∇p) = ∇·q  (should be ≈ 0 for steady-state)
+        residual = divergence(flux_x, flux_y, dx, dy)
+
+        pde_loss = (residual ** 2).mean()
+
+        # Light reconstruction term so decoder doesn't diverge
+        recon_loss = F.mse_loss(z_decoded[:, 0:1], coefficient_field)
+
+        return pde_loss + 0.1 * recon_loss
     
     def pretrain(
         self,

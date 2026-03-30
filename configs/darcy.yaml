@@ -267,7 +267,7 @@ pretraining:
 # Uses limited labeled (x, y) pairs for data efficiency evaluation.
 finetuning:
   enabled: true
-  epochs: 100  # Paper: 100 epochs fine-tuning
+  epochs: 200  # More epochs for better convergence with limited data
   batch_size: 32
   
   # Labeled data settings
@@ -275,7 +275,7 @@ finetuning:
   n_labeled_sweep: [10, 25, 50, 100, 250, 500]  # For data efficiency evaluation
   
   # Encoder freezing
-  freeze_encoder: true  # Freeze encoder during finetuning
+  freeze_encoder: false  # Allow encoder adaptation for better downstream performance
   
   # Prediction head settings
   prediction_head:
@@ -284,13 +284,13 @@ finetuning:
   
   # Optimizer (only for prediction head when encoder frozen)
   optim:
-    lr: 1e-3  # Higher LR for prediction head
+    lr: 5e-4  # Moderate LR for prediction head
     weight_decay: 1e-4
   
   # Full finetuning option (unfreeze encoder)
   full_finetune:
     enabled: true  # Enable full finetuning to adapt encoder to downstream task
-    encoder_lr_multiplier: 0.1  # Lower LR for encoder if unfrozen
+    encoder_lr_multiplier: 0.05  # Conservative LR for pretrained encoder
   
   # Checkpointing
   checkpoint:

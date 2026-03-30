@@ -69,7 +69,7 @@ class PredictionHead(nn.Module):
             layers.extend([
                 nn.ConvTranspose2d(in_channels, out_channels, kernel_size=4, stride=2, padding=1),
                 nn.GELU(),
-                nn.BatchNorm2d(out_channels),
+                nn.InstanceNorm2d(out_channels),
             ])
             in_channels = out_channels
         
@@ -93,9 +93,11 @@ class PredictionHead(nn.Module):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.InstanceNorm2d):
+                if m.weight is not None:
+                    nn.init.ones_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
     
     def forward(self, z: Tensor) -> Tensor:
         """Map encoder embeddings to solution field.
