@@ -231,7 +231,10 @@ def eval_pijepa(encoder, head, test_loader, device, in_ch=1, ch_adapt=None):
             x, y = x.to(device), y.to(device)
             if x.dim() == 3: x = x.unsqueeze(1)
             if y.dim() == 3: y = y.unsqueeze(1)
-            x_enc = ch_adapt(x) if ch_adapt is not None else x[:, :1]
+            if ch_adapt is not None:
+                x_enc = ch_adapt(x)
+            else:
+                x_enc = x[:, :in_ch]
             z = encoder(x_enc)
             preds.append(head(z).cpu())
             tgts.append(y.cpu())
