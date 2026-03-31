@@ -121,8 +121,8 @@ def save_hdf5(data, path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate ADR benchmark data")
-    parser.add_argument("--n-train", type=int, default=200)
-    parser.add_argument("--n-test", type=int, default=50)
+    parser.add_argument("--n-train", type=int, default=1000)
+    parser.add_argument("--n-test", type=int, default=200)
     parser.add_argument("--resolution", type=int, default=64)
     parser.add_argument("--n-steps", type=int, default=20)
     parser.add_argument("--output", default="data/adr")
