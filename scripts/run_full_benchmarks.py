@@ -293,9 +293,16 @@ def train_eval_baseline(name, train_loader, test_loader, n_labeled, device,
         from benchmarks.geo_fno import GeoFNOWrapper
         wrapper = GeoFNOWrapper(device=device)
     elif name == "deeponet":
+        # DeepONet only supports single-channel; for multi-channel, use first channel
         wrapper = DeepONetWrapper(device=device)
+        in_ch_eff = 1
+        out_ch_eff = 1
     else:
         raise ValueError(f"Unknown baseline: {name}")
+
+    if name != "deeponet":
+        in_ch_eff = in_ch
+        out_ch_eff = out_ch
 
     # Build dict loader — ensure shapes match what wrapper expects
     ldr = limit_loader(train_loader, n_labeled, seed)
@@ -316,7 +323,7 @@ def train_eval_baseline(name, train_loader, test_loader, n_labeled, device,
         def __len__(self):
             return len(self._loader)
 
-    wrapper.train_model(DL(ldr, in_ch, out_ch), epochs=300, lr=1e-3)
+    wrapper.train_model(DL(ldr, in_ch_eff, out_ch_eff), epochs=300, lr=1e-3)
 
     # Evaluate
     preds, tgts = [], []
@@ -325,9 +332,9 @@ def train_eval_baseline(name, train_loader, test_loader, n_labeled, device,
             x, y = x.to(device), y.to(device)
             if x.dim() == 3: x = x.unsqueeze(1)
             if y.dim() == 3: y = y.unsqueeze(1)
-            p = wrapper.predict(x[:, :in_ch])
+            p = wrapper.predict(x[:, :in_ch_eff])
             preds.append(p.cpu())
-            tgts.append(y[:, :out_ch].cpu())
+            tgts.append(y[:, :out_ch_eff].cpu())
     return compute_relative_l2(torch.cat(preds), torch.cat(tgts))
 
 
