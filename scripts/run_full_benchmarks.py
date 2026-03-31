@@ -184,14 +184,23 @@ def train_pijepa(encoder, config, train_loader, n_labeled, device, seed=42,
         patch_size=cfg_enc.get("patch_size", 8),
     ).to(device)
 
+    # Channel adapter: project multi-channel input to 1 channel for pretrained encoder
+    ch_adapt = None
+    if in_ch > 1:
+        ch_adapt = nn.Conv2d(in_ch, 1, 1).to(device)
+
     lr = float(cfg_ft.get("optim", {}).get("lr", 5e-4))
     enc_lr = lr * float(cfg_ft.get("full_finetune", {}).get("encoder_lr_multiplier", 0.2))
     epochs = cfg_ft.get("epochs", 300)
 
-    opt = torch.optim.AdamW([
+    params = [
         {"params": head.parameters(), "lr": lr},
         {"params": enc.parameters(), "lr": enc_lr},
-    ])
+    ]
+    if ch_adapt is not None:
+        params.append({"params": ch_adapt.parameters(), "lr": lr})
+
+    opt = torch.optim.AdamW(params)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-6)
     ldr = limit_loader(train_loader, n_labeled, seed)
 
@@ -200,8 +209,7 @@ def train_pijepa(encoder, config, train_loader, n_labeled, device, seed=42,
             x, y = x.to(device), y.to(device)
             if x.dim() == 3: x = x.unsqueeze(1)
             if y.dim() == 3: y = y.unsqueeze(1)
-            # If encoder expects 1 channel but data has more, take first channel for encoding
-            x_enc = x[:, :in_ch]
+            x_enc = ch_adapt(x) if ch_adapt is not None else x[:, :1]
             opt.zero_grad()
             z = enc(x_enc)
             pred = head(z)
@@ -209,19 +217,22 @@ def train_pijepa(encoder, config, train_loader, n_labeled, device, seed=42,
             opt.step()
         sched.step()
 
-    return enc, head
+    return enc, head, ch_adapt
 
 
-def eval_pijepa(encoder, head, test_loader, device, in_ch=1):
+def eval_pijepa(encoder, head, test_loader, device, in_ch=1, ch_adapt=None):
     encoder.eval()
     head.eval()
+    if ch_adapt is not None:
+        ch_adapt.eval()
     preds, tgts = [], []
     with torch.no_grad():
         for x, y in test_loader:
             x, y = x.to(device), y.to(device)
             if x.dim() == 3: x = x.unsqueeze(1)
             if y.dim() == 3: y = y.unsqueeze(1)
-            z = encoder(x[:, :in_ch])
+            x_enc = ch_adapt(x) if ch_adapt is not None else x[:, :1]
+            z = encoder(x_enc)
             preds.append(head(z).cpu())
             tgts.append(y.cpu())
     return compute_relative_l2(torch.cat(preds), torch.cat(tgts))
@@ -351,10 +362,10 @@ def run_benchmark(
         # PI-JEPA (pretrained)
         errs = []
         for s in range(n_seeds):
-            enc, head = train_pijepa(pretrained_encoder, config, train_loader,
+            enc, head, ch_ad = train_pijepa(pretrained_encoder, config, train_loader,
                                      n_l, device, seed=seed_base + s,
                                      in_ch=in_ch, out_ch=out_ch)
-            errs.append(eval_pijepa(enc, head, test_loader, device, in_ch))
+            errs.append(eval_pijepa(enc, head, test_loader, device, in_ch, ch_ad))
         results["pi_jepa"][n_l] = sum(errs) / len(errs)
         print(f"  PI-JEPA:  {results['pi_jepa'][n_l]:.4f}")
 
