@@ -297,22 +297,26 @@ def train_eval_baseline(name, train_loader, test_loader, n_labeled, device,
     else:
         raise ValueError(f"Unknown baseline: {name}")
 
-    # Build dict loader
+    # Build dict loader — ensure shapes match what wrapper expects
     ldr = limit_loader(train_loader, n_labeled, seed)
     class DL:
-        def __init__(self, loader):
+        def __init__(self, loader, in_c, out_c):
             self._loader = loader
+            self._in_c = in_c
+            self._out_c = out_c
             self.batch_size = loader.batch_size
             self.dataset = loader.dataset
         def __iter__(self):
             for x, y in self._loader:
                 if x.dim() == 3: x = x.unsqueeze(1)
                 if y.dim() == 3: y = y.unsqueeze(1)
-                yield {"x": x, "y": y}
+                # Wrappers with fix_shape expect specific channel counts
+                # Reshape to match: (B, in_ch, H, W) -> (B, in_ch, H, W)
+                yield {"x": x[:, :self._in_c], "y": y[:, :self._out_c]}
         def __len__(self):
             return len(self._loader)
 
-    wrapper.train_model(DL(ldr), epochs=300, lr=1e-3)
+    wrapper.train_model(DL(ldr, in_ch, out_ch), epochs=300, lr=1e-3)
 
     # Evaluate
     preds, tgts = [], []
@@ -321,9 +325,9 @@ def train_eval_baseline(name, train_loader, test_loader, n_labeled, device,
             x, y = x.to(device), y.to(device)
             if x.dim() == 3: x = x.unsqueeze(1)
             if y.dim() == 3: y = y.unsqueeze(1)
-            p = wrapper.predict(x)
+            p = wrapper.predict(x[:, :in_ch])
             preds.append(p.cpu())
-            tgts.append(y.cpu())
+            tgts.append(y[:, :out_ch].cpu())
     return compute_relative_l2(torch.cat(preds), torch.cat(tgts))
 
 
