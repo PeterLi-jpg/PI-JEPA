@@ -122,6 +122,13 @@ def load_twophase(bs=32):
         return x, y
     x_tr, y_tr = _load("data/twophase/twophase_train.h5")
     x_te, y_te = _load("data/twophase/twophase_test.h5")
+    # Normalize: zero-mean unit-variance per channel using training stats
+    x_mean, x_std = x_tr.mean(), x_tr.std() + 1e-8
+    y_mean, y_std = y_tr.mean(), y_tr.std() + 1e-8
+    x_tr = (x_tr - x_mean) / x_std
+    x_te = (x_te - x_mean) / x_std
+    y_tr = (y_tr - y_mean) / y_std
+    y_te = (y_te - y_mean) / y_std
     return (DataLoader(TensorDataset(x_tr, y_tr), batch_size=bs, shuffle=True),
             DataLoader(TensorDataset(x_te, y_te), batch_size=bs, shuffle=False),
             1, 1)
