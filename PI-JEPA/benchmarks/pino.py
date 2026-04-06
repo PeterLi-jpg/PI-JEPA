@@ -11,10 +11,8 @@ def fix_shape(x):
     """Ensure input tensor has shape (B, C, H, W)."""
     if x.ndim == 3:
         x = x.unsqueeze(1)
-    elif x.ndim == 4 and x.shape[-1] == 1:
-        x = x.permute(0, 3, 1, 2)
-    elif x.ndim == 4 and x.shape[1] == 1:
-        pass
+    elif x.ndim == 4:
+        pass  # already (B, C, H, W) — works for any channel count
     else:
         raise ValueError(f"Invalid shape: {x.shape}")
     return x.contiguous()

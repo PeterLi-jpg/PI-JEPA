@@ -409,10 +409,12 @@ class SelfSupervisedPretrainer:
 
         pde_loss = (residual ** 2).mean()
 
-        # Light reconstruction term so decoder doesn't diverge
-        recon_loss = F.mse_loss(z_decoded[:, 0:1], coefficient_field)
+        # Mild gradient norm penalty to keep decoded field smooth
+        # (replaces the old recon_loss that incorrectly pushed p toward K)
+        grad_norm = (dp_dx ** 2 + dp_dy ** 2).mean()
+        smoothness_loss = 0.01 * grad_norm
 
-        return pde_loss + 0.1 * recon_loss
+        return pde_loss + smoothness_loss
     
     def pretrain(
         self,
