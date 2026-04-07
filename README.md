@@ -2,7 +2,7 @@ Code Associated With:
 
 ## PI-JEPA: A Physics-Informed Joint Embedding Predictive Architecture for Multi-Step Coupled PDE Surrogate Modeling
 
-#### Brandon Yee,<sup>*1</sup> Pairie Koh<sup>1,2</sup>p
+#### Brandon Yee,<sup>*1</sup> Pairie Koh<sup>1,2</sup>
 
 <sup>1</sup> Physics Lab, Yee Collins Research Group
 
