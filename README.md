@@ -1,14 +1,12 @@
-Code Associated With:
+[![arXiv](https://img.shields.io/badge/arXiv-2604.01349-b31b1b.svg?style=plastic)](https://arxiv.org/abs/2604.01349v3)
+[![Molab](https://molab.marimo.io/molab-shield.svg)](https://molab.marimo.io/notebooks/nb_pBwJPtnwDPQzxf69DqwHCv)
 
 ## PI-JEPA: A Physics-Informed Joint Embedding Predictive Architecture for Multi-Step Coupled PDE Surrogate Modeling
 
-#### Brandon Yee,<sup>*1</sup> Pairie Koh<sup>1,2</sup>
+#### Brandon Yee, Pairie Koh
+Physics Lab, Yee Collins Research Group
 
-<sup>1</sup> Physics Lab, Yee Collins Research Group
-
-<sup>2</sup> Graduate School of Business, Stanford University
-
-<sup>*</sup> Correspondance: b.yee@ycrg-labs.org
+Correspondence: b.yee@ycrg-labs.org
 
 ---
 
