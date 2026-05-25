@@ -109,6 +109,46 @@ def _apply_pretraining_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
     physics.setdefault("weight", 0.1)
     physics.setdefault("ramp_steps", 200)
     
+    # New physics mode defaults (null = legacy mode for backward compatibility)
+    physics.setdefault("mode", None)
+    
+    # Spectral residual defaults
+    spectral = physics.setdefault("spectral", {})
+    spectral.setdefault("resolution", 64)
+    spectral.setdefault("cutoff_ratio", 0.667)
+    spectral.setdefault("dx", 1.0)
+    spectral.setdefault("dy", 1.0)
+    
+    # Latent flux defaults
+    latent_flux = physics.setdefault("latent_flux", {})
+    latent_flux.setdefault("grid_size", 8)
+    latent_flux.setdefault("n_flux_heads", 4)
+    
+    # TPFA defaults
+    tpfa = physics.setdefault("tpfa", {})
+    tpfa.setdefault("enabled", False)
+    tpfa.setdefault("dx", 1.0)
+    tpfa.setdefault("dy", 1.0)
+    
+    # Curriculum defaults
+    curriculum = physics.setdefault("curriculum", {})
+    curriculum.setdefault("warmup_steps", 1000)
+    curriculum.setdefault("pressure_ramp_steps", 500)
+    curriculum.setdefault("saturation_ramp_steps", 500)
+    curriculum.setdefault("ramp_type", "cosine")
+    
+    # Adaptive collocation defaults
+    adaptive_collocation = physics.setdefault("adaptive_collocation", {})
+    adaptive_collocation.setdefault("enabled", False)
+    adaptive_collocation.setdefault("n_points", 1024)
+    adaptive_collocation.setdefault("min_density", 0.1)
+    adaptive_collocation.setdefault("update_interval", 50)
+    
+    # Learned weights defaults
+    learned_weights = physics.setdefault("learned_weights", {})
+    learned_weights.setdefault("enabled", False)
+    learned_weights.setdefault("lr", 1e-3)
+    
     # VICReg defaults
     vicreg = pretraining.setdefault("vicreg", {})
     vicreg.setdefault("variance_weight", 0.05)
@@ -255,6 +295,9 @@ def _validate_pretraining(cfg: Dict[str, Any]) -> None:
     if not isinstance(ramp_steps, int) or ramp_steps < 0:
         raise ValueError(f"pretraining.physics.ramp_steps must be a non-negative integer, got {ramp_steps}")
     
+    # Validate physics mode
+    _validate_physics_mode(physics)
+    
     # Validate EMA settings
     ema = pretraining.get("ema", {})
     tau_start = ema.get("tau_start", 0.99)
@@ -310,3 +353,118 @@ def _validate_finetuning(cfg: Dict[str, Any]) -> None:
     encoder_lr_multiplier = full_finetune.get("encoder_lr_multiplier", 0.1)
     if not isinstance(encoder_lr_multiplier, (int, float)) or encoder_lr_multiplier <= 0:
         raise ValueError(f"finetuning.full_finetune.encoder_lr_multiplier must be positive, got {encoder_lr_multiplier}")
+
+
+def _validate_physics_mode(physics: Dict[str, Any]) -> None:
+    """Validate the new physics mode configuration fields.
+    
+    Ensures backward compatibility: when mode is None (legacy), no new fields
+    are required. When a mode is specified, validates the relevant sub-config.
+    """
+    VALID_MODES = [None, "spectral", "tpfa", "latent_flux", "combined"]
+    VALID_RAMP_TYPES = ["linear", "cosine", "step"]
+    
+    mode = physics.get("mode", None)
+    if mode not in VALID_MODES:
+        raise ValueError(
+            f"pretraining.physics.mode must be one of {VALID_MODES}, got '{mode}'"
+        )
+    
+    # If mode is None (legacy), skip validation of new fields
+    if mode is None:
+        return
+    
+    # Validate spectral config (used by "spectral" and "combined" modes)
+    if mode in ("spectral", "combined"):
+        spectral = physics.get("spectral", {})
+        resolution = spectral.get("resolution", 64)
+        if not isinstance(resolution, int) or resolution <= 0:
+            raise ValueError(
+                f"pretraining.physics.spectral.resolution must be a positive integer, got {resolution}"
+            )
+        cutoff_ratio = spectral.get("cutoff_ratio", 0.667)
+        if not isinstance(cutoff_ratio, (int, float)) or not 0 < cutoff_ratio <= 1:
+            raise ValueError(
+                f"pretraining.physics.spectral.cutoff_ratio must be in (0, 1], got {cutoff_ratio}"
+            )
+        dx = spectral.get("dx", 1.0)
+        dy = spectral.get("dy", 1.0)
+        if not isinstance(dx, (int, float)) or dx <= 0:
+            raise ValueError(f"pretraining.physics.spectral.dx must be positive, got {dx}")
+        if not isinstance(dy, (int, float)) or dy <= 0:
+            raise ValueError(f"pretraining.physics.spectral.dy must be positive, got {dy}")
+    
+    # Validate latent_flux config (used by "latent_flux" and "combined" modes)
+    if mode in ("latent_flux", "combined"):
+        latent_flux = physics.get("latent_flux", {})
+        grid_size = latent_flux.get("grid_size", 8)
+        if not isinstance(grid_size, int) or grid_size <= 0:
+            raise ValueError(
+                f"pretraining.physics.latent_flux.grid_size must be a positive integer, got {grid_size}"
+            )
+        n_flux_heads = latent_flux.get("n_flux_heads", 4)
+        if not isinstance(n_flux_heads, int) or n_flux_heads <= 0:
+            raise ValueError(
+                f"pretraining.physics.latent_flux.n_flux_heads must be a positive integer, got {n_flux_heads}"
+            )
+    
+    # Validate TPFA config (used by "tpfa" mode)
+    if mode == "tpfa":
+        tpfa = physics.get("tpfa", {})
+        dx = tpfa.get("dx", 1.0)
+        dy = tpfa.get("dy", 1.0)
+        if not isinstance(dx, (int, float)) or dx <= 0:
+            raise ValueError(f"pretraining.physics.tpfa.dx must be positive, got {dx}")
+        if not isinstance(dy, (int, float)) or dy <= 0:
+            raise ValueError(f"pretraining.physics.tpfa.dy must be positive, got {dy}")
+    
+    # Validate curriculum config (always validated when mode is set)
+    curriculum = physics.get("curriculum", {})
+    warmup_steps = curriculum.get("warmup_steps", 1000)
+    if not isinstance(warmup_steps, int) or warmup_steps < 0:
+        raise ValueError(
+            f"pretraining.physics.curriculum.warmup_steps must be a non-negative integer, got {warmup_steps}"
+        )
+    pressure_ramp_steps = curriculum.get("pressure_ramp_steps", 500)
+    if not isinstance(pressure_ramp_steps, int) or pressure_ramp_steps < 0:
+        raise ValueError(
+            f"pretraining.physics.curriculum.pressure_ramp_steps must be a non-negative integer, got {pressure_ramp_steps}"
+        )
+    saturation_ramp_steps = curriculum.get("saturation_ramp_steps", 500)
+    if not isinstance(saturation_ramp_steps, int) or saturation_ramp_steps < 0:
+        raise ValueError(
+            f"pretraining.physics.curriculum.saturation_ramp_steps must be a non-negative integer, got {saturation_ramp_steps}"
+        )
+    ramp_type = curriculum.get("ramp_type", "cosine")
+    if ramp_type not in VALID_RAMP_TYPES:
+        raise ValueError(
+            f"pretraining.physics.curriculum.ramp_type must be one of {VALID_RAMP_TYPES}, got '{ramp_type}'"
+        )
+    
+    # Validate adaptive collocation config
+    adaptive = physics.get("adaptive_collocation", {})
+    if adaptive.get("enabled", False):
+        n_points = adaptive.get("n_points", 1024)
+        if not isinstance(n_points, int) or n_points <= 0:
+            raise ValueError(
+                f"pretraining.physics.adaptive_collocation.n_points must be a positive integer, got {n_points}"
+            )
+        min_density = adaptive.get("min_density", 0.1)
+        if not isinstance(min_density, (int, float)) or not 0 < min_density <= 1:
+            raise ValueError(
+                f"pretraining.physics.adaptive_collocation.min_density must be in (0, 1], got {min_density}"
+            )
+        update_interval = adaptive.get("update_interval", 50)
+        if not isinstance(update_interval, int) or update_interval <= 0:
+            raise ValueError(
+                f"pretraining.physics.adaptive_collocation.update_interval must be a positive integer, got {update_interval}"
+            )
+    
+    # Validate learned weights config
+    learned_weights = physics.get("learned_weights", {})
+    if learned_weights.get("enabled", False):
+        lr = learned_weights.get("lr", 1e-3)
+        if not isinstance(lr, (int, float)) or lr <= 0:
+            raise ValueError(
+                f"pretraining.physics.learned_weights.lr must be positive, got {lr}"
+            )

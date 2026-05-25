@@ -10,6 +10,7 @@ from .loaders import (
     NavierStokesDataset,
     UnlabeledDarcyDataset,
 )
+from .irregular_grid import IrregularGridProcessor
 
 __all__ = [
     "DarcyDataset",
@@ -24,4 +25,5 @@ __all__ = [
     "SPE10Dataset",
     "NavierStokesDataset",
     "UnlabeledDarcyDataset",
+    "IrregularGridProcessor",
 ]

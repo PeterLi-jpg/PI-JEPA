@@ -564,24 +564,18 @@ class SelfSupervisedPretrainer:
                     optimizer, epoch_losses
                 )
             
-            # Periodic checkpoint
-            save_interval = self.config.get("pretraining", {}).get("checkpoint", {}).get("save_interval", 50)
-            if (epoch + 1) % save_interval == 0:
-                self._save_checkpoint(
-                    os.path.join(checkpoint_dir, f"checkpoint_epoch_{epoch+1}.pt"),
-                    optimizer, epoch_losses
-                )
+            # Periodic checkpoint — only save best to conserve disk
+            # (epoch checkpoints disabled to avoid filling disk during ablations)
         
-        # Save final checkpoint
-        final_path = os.path.join(checkpoint_dir, "checkpoint_final.pt")
-        self._save_checkpoint(final_path, optimizer, epoch_losses)
-        print(f"Saved final checkpoint to {final_path}")
+        # Final checkpoint — skip if best already saved (save disk)
+        print(f"Pretraining complete. Best checkpoint in {checkpoint_dir}")
         
+        best_path = os.path.join(checkpoint_dir, "checkpoint_best.pt")
         return {
             'losses': all_losses,
             'final_loss': epoch_losses['total'],
             'best_loss': best_loss,
-            'checkpoint_path': final_path,
+            'checkpoint_path': best_path,
             'n_epochs': n_epochs,
             'global_step': self.global_step
         }

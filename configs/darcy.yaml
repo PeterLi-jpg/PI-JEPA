@@ -56,7 +56,7 @@ model:
   num_predictors: 2  # K=2 for Darcy, K=3 for reactive transport
   
   encoder:
-    type: fourier  # Options: vit, fourier, multiscale_fourier
+    type: fourier  # Options: vit, fourier, multiscale_fourier, fourier_3d
     embed_dim: 384
     patch_size: 8
     image_size: 64  # Match data grid_size
@@ -68,6 +68,10 @@ model:
     drop_path: 0.1
     residual_scale: 1.0
     in_channels: 2  # 1 for pretraining (coefficient only), 2 for legacy (solution + coefficient)
+    
+    # 3D mode support (Phase 2 — 3D Extension)
+    dim_3d: false       # If true, use FourierJEPAEncoder3D for volumetric inputs
+    volume_size: 32     # Volume resolution for 3D mode (must be divisible by patch_size)
     
     # Fourier encoder specific settings
     fourier:
@@ -237,6 +241,67 @@ pretraining:
     enabled: true  # Flag to enable/disable physics residual during pretraining
     weight: 0.1  # Paper: λ_p = 0.1
     ramp_steps: 200  # Paper: ramp over first 200 steps
+    
+    # =========================================================================
+    # Physics Mode Selection (NEW)
+    # =========================================================================
+    # Controls which physics loss formulation is used during pretraining.
+    # - null: Legacy mode — uses the original FD-based Darcy residual (backward compatible)
+    # - "spectral": Spectral residual using ik-differentiation on all 64×64 modes
+    # - "tpfa": Two-Point Flux Approximation (handles high K contrasts)
+    # - "latent_flux": Decoder-free flux consistency in latent space
+    # - "combined": Simultaneous spectral + latent_flux with independent weighting
+    mode: "combined"  # "spectral" | "tpfa" | "latent_flux" | "combined" | null (legacy)
+    
+    # Spectral residual module settings (used when mode is "spectral" or "combined")
+    # Computes PDE residuals in Fourier space using ik-differentiation with
+    # a smooth 2/3-rule cutoff to prevent Gibbs ringing.
+    spectral:
+      resolution: 64        # Grid resolution for spectral computation
+      cutoff_ratio: 0.667   # Smooth spectral cutoff (2/3 rule)
+      dx: 1.0              # Grid spacing in x
+      dy: 1.0              # Grid spacing in y
+    
+    # Latent flux module settings (used when mode is "latent_flux" or "combined")
+    # Enforces inter-patch flux consistency directly in embedding space
+    # without requiring the decoder — operates on predictor output embeddings.
+    latent_flux:
+      grid_size: 8          # Patches per side (8×8 = 64 patches)
+      n_flux_heads: 4       # Number of flux projection heads
+    
+    # TPFA loss settings (used when mode is "tpfa")
+    # Uses harmonic-mean interface transmissibilities for handling
+    # permeability contrasts up to 6 orders of magnitude.
+    tpfa:
+      enabled: false        # Enable TPFA loss (alternative to spectral)
+      dx: 1.0              # Grid spacing in x
+      dy: 1.0              # Grid spacing in y
+    
+    # Physics curriculum settings — staged introduction of physics terms
+    # Phase 1: JEPA + VICReg only (warmup)
+    # Phase 2: + pressure residual (ramp in)
+    # Phase 3: + saturation transport (ramp in)
+    curriculum:
+      warmup_steps: 1000          # Steps before any physics loss is applied
+      pressure_ramp_steps: 500    # Steps to ramp pressure residual to full weight
+      saturation_ramp_steps: 500  # Steps to ramp saturation residual to full weight
+      ramp_type: "cosine"         # Ramp schedule: "linear", "cosine", or "step"
+    
+    # Adaptive collocation — concentrate physics evaluation near fronts
+    # Samples collocation points proportional to gradient magnitude while
+    # maintaining a minimum density floor everywhere.
+    adaptive_collocation:
+      enabled: true         # Enable adaptive collocation sampling
+      n_points: 1024        # Number of collocation points to sample
+      min_density: 0.1      # Minimum sampling probability floor
+      update_interval: 50   # Steps between distribution updates
+    
+    # Learned loss weights — per-sub-operator weights on log scale
+    # Each weight λ_k = exp(log_λ_k) ensures positivity.
+    # Optimized in a separate AdamW parameter group.
+    learned_weights:
+      enabled: true         # Enable learned loss weighting
+      lr: 1.0e-3            # Learning rate for weight parameters
   
   # VICReg regularization to prevent embedding collapse
   vicreg:
@@ -255,6 +320,32 @@ pretraining:
     tau_end: 0.999  # Paper: τ ends at 0.999
     warmup_fraction: 0.1  # Paper: over first 10% of epochs
   
+  # =========================================================================
+  # Conditioning Configuration (Phase 2 — Generalization)
+  # =========================================================================
+  # Optional conditioning modules that enable generalization across
+  # different fluid systems, rock-fluid interactions, and well configurations.
+  conditioning:
+    # PVT Conditioner: FiLM-based conditioning on fluid PVT properties
+    # Applies γ(pvt) * h + β(pvt) to encoder hidden features at each Fourier block.
+    pvt:
+      enabled: false
+      dim: 3  # [viscosity_ratio, compressibility, GOR]
+
+    # Well Control Conditioner: Cross-attention conditioning on well tokens
+    # Encodes well schedules as tokens and injects via cross-attention into predictor bank.
+    well_control:
+      enabled: false
+      max_wells: 20
+      well_feature_dim: 6  # [x, y, rate, bhp, status, type]
+
+    # Brooks-Corey Conditioner: Variable relative permeability parameters
+    # Supports both scalar (per-sample) and spatially varying (2D field) parameters.
+    brooks_corey:
+      enabled: false
+      lambda_range: [1.5, 4.0]
+      spatial: false  # If true, expect spatially varying 2D field inputs
+
   # Checkpointing
   checkpoint:
     save_interval: 50  # Save every N epochs

@@ -343,7 +343,17 @@ class MultiSpeciesPredictor(nn.Module):
         nn.init.normal_(self.mask_token, std=0.02)
         
         # Predictor names for interpretability
-        self.predictor_names = ["pressure", "transport", "reaction"][:self.num_predictors]
+        # Compositional mode changes naming for K=3/K=4:
+        #   compositional=True:  K=3 → [pressure, transport, composition]
+        #                        K=4 → [pressure, transport, composition, reaction]
+        #   compositional=False: K=2 → [pressure, transport]
+        #                        K=3 → [pressure, transport, reaction]
+        self.compositional = pred_cfg.get("compositional", False)
+        if self.compositional:
+            all_names = ["pressure", "transport", "composition", "reaction"]
+        else:
+            all_names = ["pressure", "transport", "reaction"]
+        self.predictor_names = all_names[:self.num_predictors]
     
     def _apply_predictor(
         self,

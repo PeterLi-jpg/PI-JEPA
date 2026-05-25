@@ -5,6 +5,9 @@ This module implements the self-supervised pretraining pipeline using only
 unlabeled coefficient fields with spatial masking, JEPA objective, and
 optional physics regularization.
 
+Supports multiple physics modes: spectral, tpfa, latent_flux, combined.
+Integrates PhysicsCurriculum, LearnedLossWeights, and AdaptiveCollocationSampler.
+
 Validates: Requirements 1, 2 (Self-Supervised Pretraining, Physics Regularization)
 """
 
@@ -20,6 +23,9 @@ from torch.utils.data import DataLoader
 from .masking import SpatialBlockMasker, build_spatial_block_masker
 from .schedules import EMAMomentumSchedule, PhysicsWeightSchedule
 from .ema import update_ema
+from .curriculum import PhysicsCurriculum
+from .learned_weights import LearnedLossWeights
+from .adaptive_collocation import AdaptiveCollocationSampler
 
 
 # ============================================================================
@@ -145,17 +151,10 @@ class SelfSupervisedPretrainer:
     Implements the pretraining phase using only unlabeled coefficient fields
     with spatial masking, JEPA objective, and optional physics regularization.
     
-    Validates: Requirements 1, 2
-    - AC 1.1: Load only coefficient fields x without requiring solution fields y
-    - AC 1.3: Apply spatial masking to partition coefficient field into context/target
-    - AC 1.4: Context_Encoder processes only context patches
-    - AC 1.5: Target_Encoder processes full coefficient field
-    - AC 1.6: Latent_Predictor predicts target embeddings from context embeddings
-    - AC 1.7: Compute JEPA_Objective as L2 distance with stop-gradient on target
-    - AC 1.8: Update Target_Encoder via EMA with momentum τ annealed 0.99→0.999
-    - AC 2.1: Decode predicted embeddings to physical space
-    - AC 2.3: Ramp physics weight λ_p from 0 to 0.1 over first 200 steps
-    - AC 2.5: Apply VICReg regularization to prevent collapse
+    Supports physics modes: spectral, tpfa, latent_flux, combined.
+    Integrates PhysicsCurriculum, LearnedLossWeights, and AdaptiveCollocationSampler.
+    
+    Validates: Requirements 1, 2, 5, 6, 7, 9, 10
     """
     
     def __init__(
@@ -184,7 +183,27 @@ class SelfSupervisedPretrainer:
         
         # Build schedules
         self.ema_schedule = self._build_ema_schedule()
+        
+        # Determine physics mode and build appropriate components
+        self._physics_mode = self._get_physics_mode()
+        
+        # Build legacy physics schedule (used only in legacy mode)
         self.physics_schedule = self._build_physics_schedule()
+        
+        # Build PhysicsCurriculum (used in new physics modes)
+        self.curriculum = self._build_curriculum()
+        
+        # Build LearnedLossWeights
+        self.learned_weights = self._build_learned_weights()
+        
+        # Build AdaptiveCollocationSampler
+        self.collocation_sampler = self._build_collocation_sampler()
+        
+        # Build physics modules based on mode
+        self._spectral_module = None
+        self._tpfa_module = None
+        self._latent_flux_module = None
+        self._init_physics_modules()
         
         # Build VICReg loss
         vicreg_cfg = config.get("pretraining", {}).get("vicreg", {})
@@ -193,9 +212,127 @@ class SelfSupervisedPretrainer:
             covariance_weight=vicreg_cfg.get("covariance_weight", 0.01)
         )
         
+        # Build conditioning modules (Phase 2 — Generalization)
+        self._pvt_conditioner = None
+        self._brooks_corey_conditioner = None
+        self._well_control_conditioner = None
+        self._init_conditioning_modules()
+        
+        # Check 3D mode
+        self._dim_3d = config.get("model", {}).get("encoder", {}).get("dim_3d", False)
+        
         # Training state
         self.global_step = 0
         self.epoch = 0
+    
+    def _get_physics_mode(self) -> Optional[str]:
+        """Determine physics mode from config. Returns None for legacy behavior."""
+        physics_cfg = self.config.get("pretraining", {}).get("physics", {})
+        mode = physics_cfg.get("mode", None)
+        if mode is not None and mode not in ("spectral", "tpfa", "latent_flux", "combined"):
+            raise ValueError(
+                f"physics.mode must be one of 'spectral', 'tpfa', 'latent_flux', 'combined', got '{mode}'"
+            )
+        return mode
+    
+    def _init_physics_modules(self) -> None:
+        """Initialize physics modules based on the configured mode."""
+        if self._physics_mode is None:
+            return  # Legacy mode — no new physics modules
+        
+        physics_cfg = self.config.get("pretraining", {}).get("physics", {})
+        
+        if self._physics_mode in ("spectral", "combined"):
+            try:
+                from ..physics.spectral_residual import SpectralResidualModule
+            except (ImportError, ValueError):
+                from physics.spectral_residual import SpectralResidualModule
+            spectral_cfg = physics_cfg.get("spectral", {})
+            self._spectral_module = SpectralResidualModule(
+                resolution=spectral_cfg.get("resolution", 64),
+                cutoff_ratio=spectral_cfg.get("cutoff_ratio", 2 / 3),
+                dx=spectral_cfg.get("dx", 1.0),
+                dy=spectral_cfg.get("dy", 1.0),
+            ).to(self.device)
+        
+        if self._physics_mode == "tpfa":
+            try:
+                from ..physics.tpfa import TPFALoss
+            except (ImportError, ValueError):
+                from physics.tpfa import TPFALoss
+            tpfa_cfg = physics_cfg.get("tpfa", {})
+            self._tpfa_module = TPFALoss(
+                dx=tpfa_cfg.get("dx", 1.0),
+                dy=tpfa_cfg.get("dy", 1.0),
+            ).to(self.device)
+        
+        if self._physics_mode in ("latent_flux", "combined"):
+            try:
+                from ..physics.latent_flux import LatentFluxModule
+            except (ImportError, ValueError):
+                from physics.latent_flux import LatentFluxModule
+            latent_flux_cfg = physics_cfg.get("latent_flux", {})
+            self._latent_flux_module = LatentFluxModule(
+                embed_dim=self.config.get("model", {}).get("encoder", {}).get("embed_dim", 384),
+                grid_size=latent_flux_cfg.get("grid_size", 8),
+                n_flux_heads=latent_flux_cfg.get("n_flux_heads", 4),
+            ).to(self.device)
+    
+    def _init_conditioning_modules(self) -> None:
+        """Initialize conditioning modules based on config (Phase 2 — Generalization).
+        
+        Supports:
+        - PVT Conditioner: FiLM-based conditioning on fluid PVT properties
+        - Brooks-Corey Conditioner: Variable relative permeability parameters
+        - Well Control Conditioner: Cross-attention on well schedule tokens
+        """
+        conditioning_cfg = self.config.get("pretraining", {}).get("conditioning", {})
+        enc_cfg = self.config.get("model", {}).get("encoder", {})
+        fourier_cfg = enc_cfg.get("fourier", {})
+        
+        # --- PVT Conditioner ---
+        pvt_cfg = conditioning_cfg.get("pvt", {})
+        if pvt_cfg.get("enabled", False):
+            try:
+                from ..models.pvt_conditioner import PVTConditioner
+            except (ImportError, ValueError):
+                from models.pvt_conditioner import PVTConditioner
+            
+            self._pvt_conditioner = PVTConditioner(
+                pvt_dim=pvt_cfg.get("dim", 3),
+                hidden_channels=fourier_cfg.get("hidden_channels", 64),
+                n_layers=fourier_cfg.get("n_layers", 4),
+            ).to(self.device)
+        
+        # --- Brooks-Corey Conditioner ---
+        bc_cfg = conditioning_cfg.get("brooks_corey", {})
+        if bc_cfg.get("enabled", False):
+            try:
+                from ..models.brooks_corey_conditioner import BrooksCoreyConditioner
+            except (ImportError, ValueError):
+                from models.brooks_corey_conditioner import BrooksCoreyConditioner
+            
+            self._brooks_corey_conditioner = BrooksCoreyConditioner(
+                n_params=3,  # λ, S_wr, S_nr
+                hidden_channels=fourier_cfg.get("hidden_channels", 64),
+                spatial=bc_cfg.get("spatial", False),
+                image_size=enc_cfg.get("image_size", 64),
+            ).to(self.device)
+        
+        # --- Well Control Conditioner ---
+        wc_cfg = conditioning_cfg.get("well_control", {})
+        if wc_cfg.get("enabled", False):
+            try:
+                from ..models.well_conditioner import WellControlConditioner
+            except (ImportError, ValueError):
+                from models.well_conditioner import WellControlConditioner
+            
+            self._well_control_conditioner = WellControlConditioner(
+                well_feature_dim=wc_cfg.get("well_feature_dim", 6),
+                embed_dim=enc_cfg.get("embed_dim", 384),
+                n_heads=enc_cfg.get("heads", 8),
+                max_wells=wc_cfg.get("max_wells", 20),
+            ).to(self.device)
     
     def _build_ema_schedule(self) -> EMAMomentumSchedule:
         """Build EMA momentum schedule from config."""
@@ -210,7 +347,7 @@ class SelfSupervisedPretrainer:
         )
     
     def _build_physics_schedule(self) -> PhysicsWeightSchedule:
-        """Build physics weight ramping schedule from config."""
+        """Build legacy physics weight ramping schedule from config."""
         pretraining_cfg = self.config.get("pretraining", {})
         physics_cfg = pretraining_cfg.get("physics", self.config.get("loss", {}).get("physics", {}))
         
@@ -219,8 +356,60 @@ class SelfSupervisedPretrainer:
             ramp_steps=physics_cfg.get("ramp_steps", 200)
         )
     
+    def _build_curriculum(self) -> PhysicsCurriculum:
+        """Build PhysicsCurriculum from config."""
+        physics_cfg = self.config.get("pretraining", {}).get("physics", {})
+        curriculum_cfg = physics_cfg.get("curriculum", {})
+        
+        return PhysicsCurriculum(
+            warmup_steps=curriculum_cfg.get("warmup_steps", 1000),
+            pressure_ramp_steps=curriculum_cfg.get("pressure_ramp_steps", 500),
+            saturation_ramp_steps=curriculum_cfg.get("saturation_ramp_steps", 500),
+            ramp_type=curriculum_cfg.get("ramp_type", "cosine"),
+        )
+    
+    def _build_learned_weights(self) -> Optional[LearnedLossWeights]:
+        """Build LearnedLossWeights if enabled in config."""
+        physics_cfg = self.config.get("pretraining", {}).get("physics", {})
+        lw_cfg = physics_cfg.get("learned_weights", {})
+        
+        if not lw_cfg.get("enabled", False):
+            return None
+        
+        # Determine number of operators based on physics mode
+        if self._physics_mode == "combined":
+            num_operators = 3  # spectral_pressure, spectral_saturation, latent_flux
+        elif self._physics_mode in ("spectral", "tpfa"):
+            num_operators = 2  # pressure, saturation
+        elif self._physics_mode == "latent_flux":
+            num_operators = 1  # latent_flux only
+        else:
+            num_operators = 2  # default
+        
+        learned_weights = LearnedLossWeights(num_operators=num_operators).to(self.device)
+        return learned_weights
+    
+    def _build_collocation_sampler(self) -> Optional[AdaptiveCollocationSampler]:
+        """Build AdaptiveCollocationSampler if enabled in config."""
+        physics_cfg = self.config.get("pretraining", {}).get("physics", {})
+        colloc_cfg = physics_cfg.get("adaptive_collocation", {})
+        
+        if not colloc_cfg.get("enabled", False):
+            return None
+        
+        return AdaptiveCollocationSampler(
+            resolution=colloc_cfg.get("resolution", 64),
+            n_points=colloc_cfg.get("n_points", 1024),
+            min_density=colloc_cfg.get("min_density", 0.1),
+            update_interval=colloc_cfg.get("update_interval", 50),
+        )
+    
     def _build_optimizer(self) -> optim.Optimizer:
-        """Build AdamW optimizer with paper specifications."""
+        """Build AdamW optimizer with paper specifications.
+        
+        Includes separate parameter group for learned loss weights if enabled.
+        Also includes parameters from conditioning modules if enabled.
+        """
         pretraining_cfg = self.config.get("pretraining", {})
         optim_cfg = pretraining_cfg.get("optim", self.config.get("training", {}).get("optim", {}))
         
@@ -235,26 +424,51 @@ class SelfSupervisedPretrainer:
             list(self.decoder.parameters())
         )
         
-        return optim.AdamW(
-            params,
-            lr=lr,
-            weight_decay=weight_decay,
-            betas=betas
-        )
+        # Add latent flux module parameters if present
+        if self._latent_flux_module is not None:
+            params = params + list(self._latent_flux_module.parameters())
+        
+        # Add conditioning module parameters
+        if self._pvt_conditioner is not None:
+            params = params + list(self._pvt_conditioner.parameters())
+        if self._brooks_corey_conditioner is not None:
+            params = params + list(self._brooks_corey_conditioner.parameters())
+        if self._well_control_conditioner is not None:
+            params = params + list(self._well_control_conditioner.parameters())
+        
+        param_groups = [
+            {"params": params, "lr": lr, "weight_decay": weight_decay, "betas": betas}
+        ]
+        
+        # Add learned weights as separate parameter group
+        if self.learned_weights is not None:
+            lw_cfg = self.config.get("pretraining", {}).get("physics", {}).get("learned_weights", {})
+            lw_lr = float(lw_cfg.get("lr", 1e-3))
+            param_groups.append(self.learned_weights.get_parameter_group(lr=lw_lr))
+        
+        return optim.AdamW(param_groups)
     
     def _forward_pretraining(
         self,
         x: torch.Tensor,
         context_idx: torch.Tensor,
-        target_idx: torch.Tensor
+        target_idx: torch.Tensor,
+        pvt_params: Optional[torch.Tensor] = None,
+        brooks_corey_params: Optional[torch.Tensor] = None,
+        well_controls: Optional[torch.Tensor] = None,
+        well_coords: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass for self-supervised pretraining.
         
         Args:
-            x: (B, 1, H, W) coefficient field (single channel)
+            x: (B, 1, H, W) or (B, 1, D, H, W) coefficient field (single channel)
             context_idx: (B, N_c) context patch indices
             target_idx: (B, N_t) target patch indices
+            pvt_params: Optional (B, pvt_dim) PVT parameters for FiLM conditioning
+            brooks_corey_params: Optional (B, n_params) or (B, n_params, H, W) Brooks-Corey params
+            well_controls: Optional (B, N_wells, well_feature_dim) well control features
+            well_coords: Optional (B, N_wells, 2) well spatial coordinates
             
         Returns:
             z_pred: (B, N_t, D) predicted target embeddings
@@ -264,7 +478,22 @@ class SelfSupervisedPretrainer:
         B = x.shape[0]
         embed_dim = self.model.embed_dim
         
+        # --- Apply PVT conditioning (FiLM) ---
+        # PVT conditioning produces (gamma, beta) pairs for each Fourier block.
+        # We apply FiLM after the encoder forward pass at the patch embedding level.
+        film_params = None
+        if self._pvt_conditioner is not None and pvt_params is not None:
+            film_params = self._pvt_conditioner(pvt_params)
+        
+        # --- Compute Brooks-Corey conditioning features ---
+        # BC features are added to the encoder output embeddings (post-encoder modulation)
+        # to avoid changing encoder in_channels and breaking target encoder compatibility.
+        bc_features_raw = None
+        if self._brooks_corey_conditioner is not None and brooks_corey_params is not None:
+            bc_features_raw = self._brooks_corey_conditioner(brooks_corey_params)  # (B, C_bc, H, W)
+        
         # AC 1.5: Target_Encoder processes full coefficient field
+        # Note: Target encoder uses original x (no conditioning) for stable targets
         with torch.no_grad():
             z_target_full = self.model.target_encoder(x)
         
@@ -275,6 +504,40 @@ class SelfSupervisedPretrainer:
         
         # AC 1.4: Context_Encoder processes only context patches
         z_full = self.model.encoder(x_masked)
+        
+        # Apply PVT FiLM conditioning to encoder output embeddings
+        if film_params is not None:
+            # Apply the last layer's (gamma, beta) to the patch embeddings
+            gamma, beta = film_params[-1]  # Use last layer's params
+            # gamma, beta: (B, hidden_channels)
+            hc = gamma.shape[-1]
+            ed = z_full.shape[-1]
+            if hc == ed:
+                z_full = gamma.unsqueeze(1) * z_full + beta.unsqueeze(1)
+            else:
+                # Apply FiLM on the first hc dimensions
+                z_full_mod = z_full.clone()
+                z_full_mod[:, :, :hc] = gamma.unsqueeze(1) * z_full[:, :, :hc] + beta.unsqueeze(1)
+                z_full = z_full_mod
+        
+        # Apply Brooks-Corey conditioning as additive bias to embeddings
+        # Now that we have z_full, we know the actual number of patches (N)
+        if bc_features_raw is not None:
+            n_patches = z_full.shape[1]
+            grid_size = int(n_patches ** 0.5)
+            bc_pooled = torch.nn.functional.adaptive_avg_pool2d(
+                bc_features_raw, (grid_size, grid_size)
+            )
+            # Flatten to (B, N, hidden_channels)
+            bc_embedding_bias = bc_pooled.flatten(2).transpose(1, 2)
+            hc = bc_embedding_bias.shape[-1]
+            ed = z_full.shape[-1]
+            if hc == ed:
+                z_full = z_full + bc_embedding_bias
+            else:
+                # Add to first hc dimensions
+                z_full = z_full.clone()
+                z_full[:, :, :hc] = z_full[:, :, :hc] + bc_embedding_bias
         
         # Replace target positions with mask tokens
         z = z_full.clone()
@@ -314,6 +577,11 @@ class SelfSupervisedPretrainer:
                 z_new
             )
         
+        # --- Apply Well Control Conditioning via cross-attention ---
+        if self._well_control_conditioner is not None and well_controls is not None and well_coords is not None:
+            well_tokens = self._well_control_conditioner.encode_wells(well_controls, well_coords)
+            z = self._well_control_conditioner(z, well_tokens)
+        
         # Gather predicted target embeddings
         z_pred = torch.gather(
             z, 1,
@@ -338,7 +606,7 @@ class SelfSupervisedPretrainer:
         coefficient_field: torch.Tensor
     ) -> torch.Tensor:
         """
-        Compute physics residual on decoded coefficient field.
+        Compute physics residual on decoded coefficient field (LEGACY mode).
         
         For pretraining, we enforce consistency between decoded and
         original coefficient field, plus smoothness constraints.
@@ -370,6 +638,93 @@ class SelfSupervisedPretrainer:
         
         return recon_loss + 0.01 * smoothness_loss
     
+    def _compute_new_physics_loss(
+        self,
+        z_pred_full: torch.Tensor,
+        x_decoded: torch.Tensor,
+        coefficient_field: torch.Tensor,
+        step: int,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Compute physics loss using new modules (spectral/tpfa/latent_flux/combined).
+        
+        Dispatches to the appropriate physics module based on self._physics_mode.
+        Applies curriculum weights and learned weights.
+        
+        Args:
+            z_pred_full: (B, N, D) full latent representation (for latent_flux)
+            x_decoded: (B, C, H, W) decoded fields (for spectral/tpfa)
+            coefficient_field: (B, 1, H, W) original K field (used as permeability)
+            step: Current training step (for curriculum)
+            
+        Returns:
+            total_physics_loss: Scalar loss tensor
+            loss_details: Dict with individual loss component values for logging
+        """
+        # Get curriculum weights for this step
+        curriculum_weights = self.curriculum.get_weights(step)
+        pressure_w = curriculum_weights["pressure"]
+        saturation_w = curriculum_weights["saturation"]
+        
+        loss_details: Dict[str, float] = {}
+        physics_losses = []
+        
+        # --- Spectral residual (operates on decoded fields) ---
+        if self._physics_mode in ("spectral", "combined") and self._spectral_module is not None:
+            # Build params dict for spectral module
+            params = {
+                "mu_w": 1.0,
+                "mu_o": 1.0,
+                "phi": 0.2,
+                "dt": 1.0,
+                "Sw_prev": x_decoded[:, 1:2, :, :].detach() if x_decoded.shape[1] > 1 else torch.zeros_like(coefficient_field),
+            }
+            spectral_loss = self._spectral_module(x_decoded, coefficient_field, params)
+            # Apply curriculum: spectral loss combines pressure + saturation
+            # Weight by average of pressure and saturation curriculum weights
+            spectral_curriculum_w = (pressure_w + saturation_w) / 2.0
+            physics_losses.append(spectral_loss * spectral_curriculum_w)
+            loss_details["spectral"] = spectral_loss.item()
+        
+        # --- TPFA loss (operates on decoded fields) ---
+        if self._physics_mode == "tpfa" and self._tpfa_module is not None:
+            params = {}
+            tpfa_loss = self._tpfa_module(x_decoded, coefficient_field, params)
+            # TPFA is pressure-only, use pressure curriculum weight
+            physics_losses.append(tpfa_loss * pressure_w)
+            loss_details["tpfa"] = tpfa_loss.item()
+        
+        # --- Latent flux (operates on z_pred directly, no decoder needed) ---
+        if self._physics_mode in ("latent_flux", "combined") and self._latent_flux_module is not None:
+            latent_flux_loss = self._latent_flux_module(z_pred_full)
+            # Latent flux uses pressure curriculum weight (it's a global consistency constraint)
+            physics_losses.append(latent_flux_loss * pressure_w)
+            loss_details["latent_flux"] = latent_flux_loss.item()
+        
+        # If no physics losses computed (all curriculum weights are 0), return zero
+        if not physics_losses:
+            zero_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+            return zero_loss, loss_details
+        
+        # Apply learned weights if available
+        if self.learned_weights is not None:
+            weights = self.learned_weights.weights
+            total_physics_loss = torch.tensor(0.0, device=self.device)
+            for i, ploss in enumerate(physics_losses):
+                if i < len(weights):
+                    total_physics_loss = total_physics_loss + weights[i] * ploss
+                else:
+                    total_physics_loss = total_physics_loss + ploss
+            loss_details["learned_weights"] = weights.detach().cpu().tolist()
+        else:
+            total_physics_loss = sum(physics_losses)
+        
+        loss_details["total_physics"] = total_physics_loss.item()
+        loss_details["curriculum_pressure"] = pressure_w
+        loss_details["curriculum_saturation"] = saturation_w
+        
+        return total_physics_loss, loss_details
+    
     def pretrain(
         self,
         data_loader: DataLoader,
@@ -397,6 +752,9 @@ class SelfSupervisedPretrainer:
             "enabled", self.config.get("loss", {}).get("physics", {}).get("enabled", True)
         )
         
+        # Determine if we're using new physics mode or legacy
+        use_new_physics = self._physics_mode is not None and physics_enabled
+        
         all_losses = []
         best_loss = float('inf')
         
@@ -405,11 +763,31 @@ class SelfSupervisedPretrainer:
         print(f"  Batch size: {data_loader.batch_size}")
         print(f"  EMA: tau {self.ema_schedule.tau_start} -> {self.ema_schedule.tau_end}")
         print(f"  Physics enabled: {physics_enabled}")
+        print(f"  Physics mode: {self._physics_mode or 'legacy'}")
+        print(f"  3D mode: {self._dim_3d}")
+        if self._pvt_conditioner is not None:
+            print(f"  PVT conditioning: enabled (dim={self._pvt_conditioner.pvt_dim})")
+        if self._brooks_corey_conditioner is not None:
+            print(f"  Brooks-Corey conditioning: enabled (spatial={self._brooks_corey_conditioner.spatial})")
+        if self._well_control_conditioner is not None:
+            print(f"  Well control conditioning: enabled (max_wells={self._well_control_conditioner.max_wells})")
+        if self.learned_weights is not None:
+            print(f"  Learned weights: enabled ({self.learned_weights.log_weights.shape[0]} operators)")
+        if self.collocation_sampler is not None:
+            print(f"  Adaptive collocation: enabled (n_points={self.collocation_sampler.n_points})")
         
         for epoch in range(n_epochs):
             self.epoch = epoch
             self.model.train()
             self.decoder.train()
+            if self._latent_flux_module is not None:
+                self._latent_flux_module.train()
+            if self._pvt_conditioner is not None:
+                self._pvt_conditioner.train()
+            if self._brooks_corey_conditioner is not None:
+                self._brooks_corey_conditioner.train()
+            if self._well_control_conditioner is not None:
+                self._well_control_conditioner.train()
             
             epoch_losses = {}
             num_batches = 0
@@ -423,12 +801,33 @@ class SelfSupervisedPretrainer:
                 
                 B = x.shape[0]
                 
+                # Extract optional conditioning data from batch
+                pvt_params = batch.get('pvt_params')
+                if pvt_params is not None:
+                    pvt_params = pvt_params.to(self.device).float()
+                
+                brooks_corey_params = batch.get('brooks_corey_params')
+                if brooks_corey_params is not None:
+                    brooks_corey_params = brooks_corey_params.to(self.device).float()
+                
+                well_controls = batch.get('well_controls')
+                if well_controls is not None:
+                    well_controls = well_controls.to(self.device).float()
+                
+                well_coords = batch.get('well_coords')
+                if well_coords is not None:
+                    well_coords = well_coords.to(self.device).float()
+                
                 # AC 1.3: Sample spatial block mask
                 context_idx, target_idx = self.masker.sample_mask(B, self.device)
                 
-                # Forward pass
+                # Forward pass (with optional conditioning)
                 z_pred, z_target, z_full = self._forward_pretraining(
-                    x, context_idx, target_idx
+                    x, context_idx, target_idx,
+                    pvt_params=pvt_params,
+                    brooks_corey_params=brooks_corey_params,
+                    well_controls=well_controls,
+                    well_coords=well_coords,
                 )
                 
                 # AC 1.7: Compute JEPA loss
@@ -439,8 +838,55 @@ class SelfSupervisedPretrainer:
                 
                 total_loss = jepa_loss + vicreg_losses['total']
                 
-                # AC 2.1, 2.3: Optional physics residual with ramping
-                if physics_enabled:
+                # Physics loss computation
+                if use_new_physics:
+                    # --- New physics mode (spectral/tpfa/latent_flux/combined) ---
+                    # In 3D mode, disable spectral/tpfa physics (not extended to 3D)
+                    # Only latent_flux works in 3D since it operates on embeddings
+                    skip_decoded_physics = self._dim_3d
+                    
+                    # Build full z representation for latent flux
+                    z_recon = z_full.clone()
+                    z_recon = z_recon.scatter(
+                        1,
+                        target_idx.clamp(min=0).unsqueeze(-1).expand(-1, -1, self.model.embed_dim),
+                        z_pred
+                    )
+                    
+                    # Decode for spectral/tpfa (only if needed and not in 3D mode)
+                    x_decoded = None
+                    if self._physics_mode in ("spectral", "tpfa", "combined") and not skip_decoded_physics:
+                        x_decoded = self.decoder(z_recon)
+                    
+                    # Compute new physics loss
+                    if skip_decoded_physics and self._physics_mode in ("spectral", "tpfa"):
+                        # 3D mode with spectral/tpfa only — skip physics entirely
+                        physics_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+                        physics_details = {"skipped_3d": True}
+                    else:
+                        physics_loss, physics_details = self._compute_new_physics_loss(
+                            z_pred_full=z_recon,
+                            x_decoded=x_decoded if x_decoded is not None else torch.zeros(B, 2, 64, 64, device=self.device),
+                            coefficient_field=x,
+                            step=self.global_step,
+                        )
+                    
+                    total_loss = total_loss + physics_loss
+                    
+                    # Log physics details
+                    for k, v in physics_details.items():
+                        if isinstance(v, (int, float)):
+                            epoch_losses[f'physics_{k}'] = epoch_losses.get(f'physics_{k}', 0) + v
+                    
+                    # Update adaptive collocation distribution periodically
+                    if (self.collocation_sampler is not None and 
+                        x_decoded is not None and
+                        self.global_step % self.collocation_sampler.update_interval == 0):
+                        with torch.no_grad():
+                            self.collocation_sampler.update_distribution(x_decoded.detach())
+                    
+                elif physics_enabled:
+                    # --- Legacy physics mode ---
                     z_recon = z_full.clone()
                     z_recon = z_recon.scatter(
                         1,
@@ -459,13 +905,25 @@ class SelfSupervisedPretrainer:
                 optimizer.zero_grad()
                 total_loss.backward()
                 
+                # Gradient clipping
+                clip_params = (
+                    list(self.model.encoder.parameters()) +
+                    list(self.model.predictors.parameters()) +
+                    list(self.decoder.parameters())
+                )
+                if self._latent_flux_module is not None:
+                    clip_params = clip_params + list(self._latent_flux_module.parameters())
+                if self.learned_weights is not None:
+                    clip_params = clip_params + list(self.learned_weights.parameters())
+                if self._pvt_conditioner is not None:
+                    clip_params = clip_params + list(self._pvt_conditioner.parameters())
+                if self._brooks_corey_conditioner is not None:
+                    clip_params = clip_params + list(self._brooks_corey_conditioner.parameters())
+                if self._well_control_conditioner is not None:
+                    clip_params = clip_params + list(self._well_control_conditioner.parameters())
+                
                 if grad_clip is not None:
-                    torch.nn.utils.clip_grad_norm_(
-                        list(self.model.encoder.parameters()) +
-                        list(self.model.predictors.parameters()) +
-                        list(self.decoder.parameters()),
-                        grad_clip
-                    )
+                    torch.nn.utils.clip_grad_norm_(clip_params, grad_clip)
                 
                 optimizer.step()
                 
@@ -482,7 +940,7 @@ class SelfSupervisedPretrainer:
                 num_batches += 1
             
             for k in epoch_losses:
-                if k != 'physics_weight':
+                if k not in ('physics_weight', 'physics_curriculum_pressure', 'physics_curriculum_saturation'):
                     epoch_losses[k] /= max(num_batches, 1)
             
             epoch_losses['tau'] = tau
@@ -495,7 +953,9 @@ class SelfSupervisedPretrainer:
                     f"JEPA: {epoch_losses['jepa']:.4f} | "
                     f"τ: {tau:.4f}"
                 )
-                if physics_enabled:
+                if use_new_physics:
+                    log_msg += f" | mode: {self._physics_mode}"
+                elif physics_enabled:
                     log_msg += f" | λ_p: {epoch_losses.get('physics_weight', 0):.4f}"
                 print(log_msg)
             
@@ -513,11 +973,20 @@ class SelfSupervisedPretrainer:
                     optimizer, epoch_losses
                 )
         
+        # Log final learned weight values at training completion
+        if self.learned_weights is not None:
+            final_weights = self.learned_weights.weights.detach().cpu().tolist()
+            print(f"Final learned loss weights: {final_weights}")
+            # Store in results for downstream use
+            weight_names = self._get_weight_names()
+            for i, (name, val) in enumerate(zip(weight_names, final_weights)):
+                print(f"  {name}: {val:.6f}")
+        
         final_path = os.path.join(checkpoint_dir, "checkpoint_final.pt")
         self._save_checkpoint(final_path, optimizer, epoch_losses)
         print(f"Saved final checkpoint to {final_path}")
         
-        return {
+        results = {
             'losses': all_losses,
             'final_loss': epoch_losses['total'],
             'best_loss': best_loss,
@@ -525,6 +994,24 @@ class SelfSupervisedPretrainer:
             'n_epochs': n_epochs,
             'global_step': self.global_step
         }
+        
+        if self.learned_weights is not None:
+            results['final_learned_weights'] = dict(
+                zip(self._get_weight_names(), self.learned_weights.weights.detach().cpu().tolist())
+            )
+        
+        return results
+    
+    def _get_weight_names(self) -> list:
+        """Get descriptive names for each learned weight based on physics mode."""
+        if self._physics_mode == "combined":
+            return ["spectral", "latent_flux", "extra"][:self.learned_weights.log_weights.shape[0]]
+        elif self._physics_mode in ("spectral", "tpfa"):
+            return ["pressure", "saturation"][:self.learned_weights.log_weights.shape[0]]
+        elif self._physics_mode == "latent_flux":
+            return ["latent_flux"][:self.learned_weights.log_weights.shape[0]]
+        else:
+            return [f"weight_{i}" for i in range(self.learned_weights.log_weights.shape[0])]
     
     def _save_checkpoint(
         self,
@@ -544,8 +1031,25 @@ class SelfSupervisedPretrainer:
             'global_step': self.global_step,
             'ema_tau': self.ema_schedule.get_tau(self.epoch),
             'config': self.config,
-            'metrics': metrics
+            'metrics': metrics,
+            'physics_mode': self._physics_mode,
         }
+        
+        # Save learned weights state if present
+        if self.learned_weights is not None:
+            checkpoint['learned_weights_state_dict'] = self.learned_weights.state_dict()
+        
+        # Save latent flux module state if present
+        if self._latent_flux_module is not None:
+            checkpoint['latent_flux_state_dict'] = self._latent_flux_module.state_dict()
+        
+        # Save conditioning module states if present
+        if self._pvt_conditioner is not None:
+            checkpoint['pvt_conditioner_state_dict'] = self._pvt_conditioner.state_dict()
+        if self._brooks_corey_conditioner is not None:
+            checkpoint['brooks_corey_conditioner_state_dict'] = self._brooks_corey_conditioner.state_dict()
+        if self._well_control_conditioner is not None:
+            checkpoint['well_control_conditioner_state_dict'] = self._well_control_conditioner.state_dict()
         
         os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
         torch.save(checkpoint, path)
@@ -563,6 +1067,7 @@ def build_model_for_pretraining(
     Build PI-JEPA model configured for self-supervised pretraining.
     
     Uses single-channel encoder for coefficient-only input.
+    Supports 3D mode (FourierJEPAEncoder3D) and Brooks-Corey extra channels.
     
     Args:
         config: Configuration dictionary
@@ -574,9 +1079,30 @@ def build_model_for_pretraining(
     # Import here to avoid circular imports
     from ..models import ViTEncoder, Predictor, PIJEPA, Decoder
     
-    # Build encoder with single channel input for pretraining
-    encoder = ViTEncoder(config, in_channels=1).to(device)
-    target_encoder = ViTEncoder(config, in_channels=1).to(device)
+    enc_cfg = config.get("model", {}).get("encoder", {})
+    dim_3d = enc_cfg.get("dim_3d", False)
+    
+    # Encoder always uses in_channels=1 for coefficient field input.
+    # Conditioning (PVT, Brooks-Corey) is applied post-encoder as embedding modulation.
+    in_channels = 1
+    
+    # Validate 3D config consistency
+    if dim_3d:
+        volume_size = enc_cfg.get("volume_size", 32)
+        patch_size = enc_cfg.get("patch_size", 8)
+        if volume_size % patch_size != 0:
+            raise ValueError(
+                f"volume_size ({volume_size}) must be divisible by patch_size ({patch_size})"
+            )
+    
+    # Build encoder based on mode
+    if dim_3d:
+        from ..models import FourierJEPAEncoder3D
+        encoder = FourierJEPAEncoder3D(config, in_channels=in_channels).to(device)
+        target_encoder = FourierJEPAEncoder3D(config, in_channels=in_channels).to(device)
+    else:
+        encoder = ViTEncoder(config, in_channels=in_channels).to(device)
+        target_encoder = ViTEncoder(config, in_channels=in_channels).to(device)
     
     # Build predictors
     predictors = [
@@ -609,6 +1135,63 @@ def build_model_for_pretraining(
     ).to(device)
     
     return model, decoder
+
+
+def validate_conditioning_config(config: Dict[str, Any]) -> None:
+    """Validate conditioning and 3D configuration consistency.
+    
+    Raises ValueError if configuration is inconsistent.
+    
+    Checks:
+    - volume_size must be divisible by patch_size when dim_3d is True
+    - physics.mode must be valid
+    - curriculum.ramp_type must be valid
+    """
+    enc_cfg = config.get("model", {}).get("encoder", {})
+    dim_3d = enc_cfg.get("dim_3d", False)
+    
+    if dim_3d:
+        volume_size = enc_cfg.get("volume_size", 32)
+        patch_size = enc_cfg.get("patch_size", 8)
+        if volume_size % patch_size != 0:
+            raise ValueError(
+                f"model.encoder.volume_size ({volume_size}) must be divisible by "
+                f"model.encoder.patch_size ({patch_size})"
+            )
+    
+    # Validate physics mode
+    physics_cfg = config.get("pretraining", {}).get("physics", {})
+    mode = physics_cfg.get("mode", None)
+    valid_modes = (None, "spectral", "tpfa", "latent_flux", "combined")
+    if mode not in valid_modes:
+        raise ValueError(
+            f"pretraining.physics.mode must be one of {valid_modes}, got '{mode}'"
+        )
+    
+    # Validate curriculum ramp type
+    curriculum_cfg = physics_cfg.get("curriculum", {})
+    ramp_type = curriculum_cfg.get("ramp_type", "cosine")
+    valid_ramp_types = ("linear", "cosine", "step")
+    if ramp_type not in valid_ramp_types:
+        raise ValueError(
+            f"pretraining.physics.curriculum.ramp_type must be one of {valid_ramp_types}, "
+            f"got '{ramp_type}'"
+        )
+    
+    # Validate conditioning config
+    conditioning_cfg = config.get("pretraining", {}).get("conditioning", {})
+    
+    pvt_cfg = conditioning_cfg.get("pvt", {})
+    if pvt_cfg.get("enabled", False):
+        pvt_dim = pvt_cfg.get("dim", 3)
+        if pvt_dim < 1:
+            raise ValueError(f"conditioning.pvt.dim must be >= 1, got {pvt_dim}")
+    
+    wc_cfg = conditioning_cfg.get("well_control", {})
+    if wc_cfg.get("enabled", False):
+        max_wells = wc_cfg.get("max_wells", 20)
+        if max_wells < 1:
+            raise ValueError(f"conditioning.well_control.max_wells must be >= 1, got {max_wells}")
 
 
 def build_unlabeled_dataloader(

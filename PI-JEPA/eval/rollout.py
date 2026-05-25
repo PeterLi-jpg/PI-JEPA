@@ -357,6 +357,104 @@ class RolloutEvaluator:
 
         return results
 
+    def evaluate_per_step(
+        self,
+        x_init: torch.Tensor,
+        ground_truth: torch.Tensor,
+        steps: int = 10,
+        metric_fn=None,
+    ) -> dict:
+        """Evaluate model computing error at each autoregressive step.
+
+        Produces error curves suitable for plotting rollout degradation.
+
+        Args:
+            x_init: Initial condition (B, C, H, W).
+            ground_truth: Ground truth trajectory (B, T, C, H, W) or (B, T, ...).
+            steps: Number of autoregressive steps (at least 10 recommended).
+            metric_fn: Error metric function. Defaults to relative L2.
+
+        Returns:
+            Dict with:
+                - 'predictions': Tensor of shape (B, steps, ...)
+                - 'errors': List of T error values (one per step)
+                - 'steps': Number of steps evaluated
+        """
+        if metric_fn is None:
+            metric_fn = self._relative_l2_error
+
+        # Cap steps to available ground truth
+        available_steps = ground_truth.shape[1] if ground_truth is not None else steps
+        actual_steps = min(steps, available_steps)
+
+        # Perform rollout
+        predictions = self.rollout_single(x_init, actual_steps)
+
+        # Compute per-step errors
+        errors = []
+        for t in range(actual_steps):
+            pred_t = predictions[:, t]
+            if ground_truth is not None:
+                gt_t = ground_truth[:, t].to(self.device)
+                error = metric_fn(pred_t, gt_t)
+                if isinstance(error, torch.Tensor):
+                    error = error.item()
+                errors.append(error)
+            else:
+                errors.append(0.0)
+
+        return {
+            'predictions': predictions,
+            'errors': errors,
+            'steps': actual_steps,
+        }
+
+    def produce_error_curves(
+        self,
+        dataloader,
+        steps: int = 10,
+        metric_fn=None,
+    ) -> dict:
+        """Produce error curves over a dataset for plotting.
+
+        Args:
+            dataloader: DataLoader yielding (x_init, ground_truth) batches.
+            steps: Number of rollout steps.
+            metric_fn: Error metric function.
+
+        Returns:
+            Dict with averaged error curve and per-sample details.
+        """
+        if metric_fn is None:
+            metric_fn = self._relative_l2_error
+
+        all_errors = []  # List of per-step error lists
+
+        for batch in dataloader:
+            if isinstance(batch, (list, tuple)) and len(batch) >= 2:
+                x_init, ground_truth = batch[0], batch[1]
+            else:
+                continue
+
+            result = self.evaluate_per_step(x_init, ground_truth, steps, metric_fn)
+            all_errors.append(result['errors'])
+
+        if not all_errors:
+            return {'mean_errors': [], 'steps': 0}
+
+        # Average errors across batches
+        n_steps = len(all_errors[0])
+        mean_errors = []
+        for t in range(n_steps):
+            step_errors = [errs[t] for errs in all_errors if t < len(errs)]
+            mean_errors.append(sum(step_errors) / len(step_errors))
+
+        return {
+            'mean_errors': mean_errors,
+            'all_errors': all_errors,
+            'steps': n_steps,
+        }
+
     def _relative_l2_error(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """Relative L2 error: ||û - u||_2 / ||u||_2."""
         # Flatten spatial dimensions

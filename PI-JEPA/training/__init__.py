@@ -1,5 +1,6 @@
 from .loss import LossBuilder, JEPAAlignmentLoss, PhysicsLoss
 from .ema import EMATeacher, update_ema
+from .learned_weights import LearnedLossWeights
 from .engine import Engine
 from .finetune import LinearProbe, FineTuningPipeline
 from .schedules import (
@@ -18,6 +19,8 @@ from .pretrainer import (
     build_model_for_pretraining,
     build_unlabeled_dataloader,
 )
+from .curriculum import PhysicsCurriculum
+from .adaptive_collocation import AdaptiveCollocationSampler
 
 __all__ = [
     "LossBuilder",
@@ -25,6 +28,7 @@ __all__ = [
     "PhysicsLoss",
     "EMATeacher",
     "update_ema",
+    "LearnedLossWeights",
     "Engine",
     "LinearProbe",
     "FineTuningPipeline",
@@ -41,4 +45,6 @@ __all__ = [
     "compute_jepa_loss",
     "build_model_for_pretraining",
     "build_unlabeled_dataloader",
+    "PhysicsCurriculum",
+    "AdaptiveCollocationSampler",
 ]

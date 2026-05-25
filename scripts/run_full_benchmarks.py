@@ -223,7 +223,7 @@ def _build_unlabeled_loader_adr(bs=64):
 def pretrain_on_domain(domain, config, device, output_dir, n_epochs=None,
                        config_overrides=None):
     """Pretrain a PI-JEPA encoder on domain-specific unlabeled data."""
-    from pretrain import build_model_for_pretraining, SelfSupervisedPretrainer
+    from training.pretrainer import build_model_for_pretraining, SelfSupervisedPretrainer
 
     if n_epochs is None:
         n_epochs = PRETRAIN_EPOCHS
@@ -1016,8 +1016,10 @@ def main():
                 print(f"Found existing checkpoint: {ckpt}")
             else:
                 print("Running pretraining (500 epochs)...")
-                from pretrain import pretrain
-                ckpt = pretrain(args.config, pretrain_dir)
+                darcy_encoder = pretrain_on_domain(
+                    "darcy", config, device, args.output)
+                ckpt = os.path.join(args.output, "pretrain_darcy",
+                                    "checkpoint_best.pt")
                 print(f"Pretraining done: {ckpt}")
         darcy_encoder = load_encoder(ckpt, config, device)
         encoders = {b: darcy_encoder for b in args.benchmarks}
