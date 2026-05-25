@@ -22,11 +22,208 @@ def divergence(fx, fy, dx, dy):
     return dfx_dx + dfy_dy
 
 
+# =============================================================================
+# 3D primitives — second-order central differences with reflective BCs.
+# Tensors are (B, C, D, H, W). F.pad ordering for 3D is
+# (W_left, W_right, H_left, H_right, D_left, D_right).
+# =============================================================================
+
+
+def grad_x_3d(u, dx):
+    """∂/∂x along the W axis."""
+    u_pad = F.pad(u, (1, 1, 0, 0, 0, 0), mode="reflect")
+    return (u_pad[:, :, :, :, 2:] - u_pad[:, :, :, :, :-2]) / (2 * dx + 1e-6)
+
+
+def grad_y_3d(u, dy):
+    """∂/∂y along the H axis."""
+    u_pad = F.pad(u, (0, 0, 1, 1, 0, 0), mode="reflect")
+    return (u_pad[:, :, :, 2:, :] - u_pad[:, :, :, :-2, :]) / (2 * dy + 1e-6)
+
+
+def grad_z_3d(u, dz):
+    """∂/∂z along the D axis (depth)."""
+    u_pad = F.pad(u, (0, 0, 0, 0, 1, 1), mode="reflect")
+    return (u_pad[:, :, 2:, :, :] - u_pad[:, :, :-2, :, :]) / (2 * dz + 1e-6)
+
+
+def divergence_3d(fx, fy, fz, dx, dy, dz):
+    """∇·(fx, fy, fz) for 5D tensors (B, C, D, H, W)."""
+    fx_pad = F.pad(fx, (1, 1, 0, 0, 0, 0), mode="reflect")
+    fy_pad = F.pad(fy, (0, 0, 1, 1, 0, 0), mode="reflect")
+    fz_pad = F.pad(fz, (0, 0, 0, 0, 1, 1), mode="reflect")
+
+    dfx_dx = (fx_pad[:, :, :, :, 2:] - fx_pad[:, :, :, :, :-2]) / (2 * dx + 1e-6)
+    dfy_dy = (fy_pad[:, :, :, 2:, :] - fy_pad[:, :, :, :-2, :]) / (2 * dy + 1e-6)
+    dfz_dz = (fz_pad[:, :, 2:, :, :] - fz_pad[:, :, :-2, :, :]) / (2 * dz + 1e-6)
+    return dfx_dx + dfy_dy + dfz_dz
+
+
+def darcy_residual_3d(p, K, q=None, dx=1.0, dy=1.0, dz=1.0):
+    """Steady-state single-phase Darcy residual in 3D: -∇·(K ∇p) - q.
+
+    Args:
+        p:  (B, 1, D, H, W) pressure field (decoded)
+        K:  (B, 1, D, H, W) permeability field (conditioning)
+        q:  (B, 1, D, H, W) source term, or None → assumed zero
+    Returns:
+        residual: (B, 1, D, H, W). Squaring and meaning gives the PDE loss.
+    """
+    if p.dim() != 5 or K.dim() != 5:
+        raise ValueError(
+            f"darcy_residual_3d expects 5D inputs (B,1,D,H,W); got p={tuple(p.shape)}, K={tuple(K.shape)}"
+        )
+    dp_dx = grad_x_3d(p, dx)
+    dp_dy = grad_y_3d(p, dy)
+    dp_dz = grad_z_3d(p, dz)
+
+    flux_x = -K * dp_dx
+    flux_y = -K * dp_dy
+    flux_z = -K * dp_dz
+
+    div_term = divergence_3d(flux_x, flux_y, flux_z, dx, dy, dz)
+    if q is None:
+        return div_term
+    return div_term - q
+
+
+# =============================================================================
+# Spectral physics residuals.
+# Paper contribution (iii): the original PI-JEPA paper found its FD physics
+# residual neutral-to-harmful (-8.1% in the ablation). The hypothesis from
+# the paper's own Discussion was that the finite-difference Laplacian
+# stencil introduces dispersion artifacts that conflict with the JEPA loss.
+# Spectral derivatives don't have dispersion error: ∂/∂x ↔ i·k_x in Fourier
+# space. We assume periodic boundaries (reasonable approximation for our
+# synthetic Darcy on the unit cube with a centered Gaussian source).
+# =============================================================================
+
+
+def _spectral_grad_3d(u: torch.Tensor, dx: float, dy: float, dz: float):
+    """Compute (∂u/∂x, ∂u/∂y, ∂u/∂z) via 3D rFFT.
+
+    u: (B, C, D, H, W). Returns three tensors of the same shape.
+    Periodic BCs assumed.
+    """
+    B, C, D, H, W = u.shape
+    u_ft = torch.fft.rfftn(u, dim=(-3, -2, -1))
+
+    # Build wavenumber grids matching rFFT layout. rFFT halves the LAST dim.
+    kz = torch.fft.fftfreq(D, d=dz, device=u.device) * 2 * torch.pi   # (D,)
+    ky = torch.fft.fftfreq(H, d=dy, device=u.device) * 2 * torch.pi   # (H,)
+    kx = torch.fft.rfftfreq(W, d=dx, device=u.device) * 2 * torch.pi  # (W//2+1,)
+
+    KZ = kz.view(D, 1, 1)
+    KY = ky.view(1, H, 1)
+    KX = kx.view(1, 1, -1)
+
+    # ∂u/∂x via i * k_x * û
+    dxu_ft = 1j * KX * u_ft
+    dyu_ft = 1j * KY * u_ft
+    dzu_ft = 1j * KZ * u_ft
+
+    dxu = torch.fft.irfftn(dxu_ft, s=(D, H, W), dim=(-3, -2, -1))
+    dyu = torch.fft.irfftn(dyu_ft, s=(D, H, W), dim=(-3, -2, -1))
+    dzu = torch.fft.irfftn(dzu_ft, s=(D, H, W), dim=(-3, -2, -1))
+    return dxu, dyu, dzu
+
+
+def _spectral_div_3d(fx: torch.Tensor, fy: torch.Tensor, fz: torch.Tensor,
+                     dx: float, dy: float, dz: float) -> torch.Tensor:
+    """Compute ∇·(fx, fy, fz) via spectral derivatives. Periodic BCs."""
+    B, C, D, H, W = fx.shape
+    fx_ft = torch.fft.rfftn(fx, dim=(-3, -2, -1))
+    fy_ft = torch.fft.rfftn(fy, dim=(-3, -2, -1))
+    fz_ft = torch.fft.rfftn(fz, dim=(-3, -2, -1))
+
+    kz = torch.fft.fftfreq(D, d=dz, device=fx.device) * 2 * torch.pi
+    ky = torch.fft.fftfreq(H, d=dy, device=fx.device) * 2 * torch.pi
+    kx = torch.fft.rfftfreq(W, d=dx, device=fx.device) * 2 * torch.pi
+
+    KZ = kz.view(D, 1, 1)
+    KY = ky.view(1, H, 1)
+    KX = kx.view(1, 1, -1)
+
+    div_ft = 1j * (KX * fx_ft + KY * fy_ft + KZ * fz_ft)
+    return torch.fft.irfftn(div_ft, s=(D, H, W), dim=(-3, -2, -1))
+
+
+def spectral_darcy_residual_3d(p, K, q=None, dx=1.0, dy=1.0, dz=1.0):
+    """Spectral (FFT-based) 3D Darcy residual: -∇·(K ∇p) - q.
+
+    Mathematically identical to darcy_residual_3d but uses exact spectral
+    derivatives instead of second-order central differences. Should produce
+    a cleaner gradient signal that doesn't conflict with the JEPA loss the
+    way the FD residual did in the original paper.
+    """
+    if p.dim() != 5 or K.dim() != 5:
+        raise ValueError(
+            f"spectral_darcy_residual_3d expects 5D (B,1,D,H,W); got p={p.shape}, K={K.shape}"
+        )
+    dpx, dpy, dpz = _spectral_grad_3d(p, dx, dy, dz)
+    flux_x = -K * dpx
+    flux_y = -K * dpy
+    flux_z = -K * dpz
+    div_term = _spectral_div_3d(flux_x, flux_y, flux_z, dx, dy, dz)
+    if q is None:
+        return div_term
+    return div_term - q
+
+
+def _spectral_grad_2d(u: torch.Tensor, dx: float, dy: float):
+    """2D analog of _spectral_grad_3d. u: (B, C, H, W)."""
+    B, C, H, W = u.shape
+    u_ft = torch.fft.rfft2(u, dim=(-2, -1))
+    ky = torch.fft.fftfreq(H, d=dy, device=u.device) * 2 * torch.pi
+    kx = torch.fft.rfftfreq(W, d=dx, device=u.device) * 2 * torch.pi
+    KY = ky.view(H, 1)
+    KX = kx.view(1, -1)
+    dxu_ft = 1j * KX * u_ft
+    dyu_ft = 1j * KY * u_ft
+    dxu = torch.fft.irfft2(dxu_ft, s=(H, W), dim=(-2, -1))
+    dyu = torch.fft.irfft2(dyu_ft, s=(H, W), dim=(-2, -1))
+    return dxu, dyu
+
+
+def _spectral_div_2d(fx, fy, dx: float, dy: float):
+    """2D divergence via FFT."""
+    B, C, H, W = fx.shape
+    fx_ft = torch.fft.rfft2(fx, dim=(-2, -1))
+    fy_ft = torch.fft.rfft2(fy, dim=(-2, -1))
+    ky = torch.fft.fftfreq(H, d=dy, device=fx.device) * 2 * torch.pi
+    kx = torch.fft.rfftfreq(W, d=dx, device=fx.device) * 2 * torch.pi
+    KY = ky.view(H, 1)
+    KX = kx.view(1, -1)
+    div_ft = 1j * (KX * fx_ft + KY * fy_ft)
+    return torch.fft.irfft2(div_ft, s=(H, W), dim=(-2, -1))
+
+
+def spectral_darcy_residual_2d(p, K, q=None, dx=1.0, dy=1.0):
+    """Spectral (FFT-based) 2D Darcy residual: -∇·(K ∇p) - q."""
+    if p.dim() != 4 or K.dim() != 4:
+        raise ValueError(
+            f"spectral_darcy_residual_2d expects 4D (B,1,H,W); got p={p.shape}, K={K.shape}"
+        )
+    dpx, dpy = _spectral_grad_2d(p, dx, dy)
+    flux_x = -K * dpx
+    flux_y = -K * dpy
+    div_term = _spectral_div_2d(flux_x, flux_y, dx, dy)
+    if q is None:
+        return div_term
+    return div_term - q
+
+
 def effective_saturation(Sw, Swr=0.0, Snr=0.0):
     return (Sw - Swr) / (1.0 - Swr - Snr + 1e-6)
 
 
 def rel_perm(Sw, krw_exp, kro_exp, Swr=0.0, Snr=0.0):
+    """LEGACY simple-power-law relperm: k_rw = Se^krw_exp, k_rn = (1-Se)^kro_exp.
+
+    Kept for back-compat. NOT the Brooks-Corey form the paper specifies.
+    For the published Brooks-Corey form (Eq. 10 of the PI-JEPA paper), use
+    `brooks_corey_rel_perm(Sw, lambda_bc, Swr, Snr)` below.
+    """
     Se = effective_saturation(Sw, Swr, Snr)
     Se = Se.clamp(1e-4, 1.0 - 1e-4)
 
@@ -36,8 +233,40 @@ def rel_perm(Sw, krw_exp, kro_exp, Swr=0.0, Snr=0.0):
     return krw, kro
 
 
-def mobility(Sw, mu_w, mu_o, krw_exp, kro_exp):
-    krw, kro = rel_perm(Sw, krw_exp, kro_exp)
+def brooks_corey_rel_perm(Sw, lambda_bc, Swr=0.0, Snr=0.0):
+    """Brooks-Corey relative permeabilities (the paper's Eq. 10 formulation).
+
+        k_rw = S_e^((2 + 3λ) / λ)
+        k_rn = (1 - S_e)^2 * (1 - S_e^((2 + λ) / λ))
+
+    where S_e = (S_w - S_wr) / (1 - S_wr - S_nr) and λ is the pore-size
+    distribution index.
+
+    This was previously only available via the dead `BrooksCoreyModel` class;
+    exposing it as a function so the LIVE physics-loss path can use it.
+    """
+    Se = effective_saturation(Sw, Swr, Snr)
+    Se = Se.clamp(1e-4, 1.0 - 1e-4)
+
+    exp_w = (2.0 + 3.0 * lambda_bc) / lambda_bc
+    exp_n = (2.0 + lambda_bc) / lambda_bc
+
+    krw = Se ** exp_w
+    krn = (1.0 - Se) ** 2 * (1.0 - Se ** exp_n)
+    return krw, krn
+
+
+def mobility(Sw, mu_w, mu_o, krw_exp, kro_exp, lambda_bc=None):
+    """Phase mobilities and water fractional flow.
+
+    If `lambda_bc` is provided, uses the Brooks-Corey relperm form (matches
+    the PI-JEPA paper Eq. 10). Otherwise falls back to the legacy simple
+    power-law `rel_perm(.., krw_exp, kro_exp)` for back-compat.
+    """
+    if lambda_bc is not None:
+        krw, kro = brooks_corey_rel_perm(Sw, lambda_bc)
+    else:
+        krw, kro = rel_perm(Sw, krw_exp, kro_exp)
 
     lambda_w = krw / (mu_w + 1e-6)
     lambda_o = kro / (mu_o + 1e-6)

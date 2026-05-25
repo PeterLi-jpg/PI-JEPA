@@ -306,15 +306,203 @@ def build_spatial_block_masker(config: dict) -> SpatialBlockMasker:
     """
     masking_cfg = config.get("pretraining", {}).get("masking", {})
     model_cfg = config.get("model", {}).get("encoder", {})
-    
-    # Calculate grid size from image and patch size
+
     image_size = model_cfg.get("image_size", 64)
     patch_size = model_cfg.get("patch_size", 8)
-    grid_size = image_size // patch_size
-    
+
+    encoder_type = model_cfg.get("type", "vit").lower()
+    if encoder_type in ("fourier_3d", "fourier3d"):
+        # Support either scalar (cubic) or 3-list (rectangular) image/patch.
+        def _triple(v):
+            if isinstance(v, int):
+                return (v, v, v)
+            return tuple(int(x) for x in v)
+
+        ig = _triple(image_size)
+        pg = _triple(patch_size)
+        grid_dhw = (ig[0] // pg[0], ig[1] // pg[1], ig[2] // pg[2])
+        min_axis = min(grid_dhw)
+        return SpatialBlockMasker3D(
+            grid_size=grid_dhw,
+            context_ratio=masking_cfg.get("context_ratio", 0.65),
+            min_block_size=masking_cfg.get("min_block_size", 1),
+            max_block_size=masking_cfg.get("max_block_size", max(2, min_axis // 2)),
+        )
+
+    # 2D path: image_size and patch_size are scalars
+    grid_size_2d = image_size // patch_size if isinstance(image_size, int) else (image_size[0] // patch_size[0])
     return SpatialBlockMasker(
-        grid_size=grid_size,
+        grid_size=grid_size_2d,
         context_ratio=masking_cfg.get("context_ratio", 0.65),
         min_block_size=masking_cfg.get("min_block_size", 2),
         max_block_size=masking_cfg.get("max_block_size", 4)
     )
+
+
+# =============================================================================
+# 3D spatial block masker — operates on a cubic patch grid (gd, gh, gw).
+# Patch indices are flattened in (d, h, w) row-major order, matching
+# FourierJEPAEncoder3D's flatten(2).transpose(1, 2) convention.
+# =============================================================================
+
+
+class SpatialBlockMasker3D:
+    """Spatial block masking over a 3D (cubic) patch grid.
+
+    Samples a random axis-aligned cuboid as the target region; the context
+    region is the complement. Returns padded (B, N_t) and (B, N_c) tensors
+    in the same format as SpatialBlockMasker so downstream code is unchanged.
+    """
+
+    def __init__(
+        self,
+        grid_size,
+        context_ratio: float = 0.65,
+        min_block_size: int = 1,
+        max_block_size: int = 4,
+    ):
+        # grid_size may be a scalar (cubic) or a 3-tuple (rectangular: gd, gh, gw).
+        if isinstance(grid_size, int):
+            self.grid_size_dhw = (grid_size, grid_size, grid_size)
+        elif hasattr(grid_size, "__len__") and len(grid_size) == 3:
+            self.grid_size_dhw = tuple(int(g) for g in grid_size)
+        else:
+            raise ValueError(
+                f"grid_size must be int or 3-tuple, got {grid_size!r}"
+            )
+        gd, gh, gw = self.grid_size_dhw
+        if min(gd, gh, gw) < 1:
+            raise ValueError(f"all grid_size axes must be >= 1, got {self.grid_size_dhw}")
+        if not 0 < context_ratio < 1:
+            raise ValueError(f"context_ratio must be in (0, 1), got {context_ratio}")
+        if min_block_size < 1:
+            raise ValueError(f"min_block_size must be >= 1, got {min_block_size}")
+        if max_block_size < min_block_size:
+            raise ValueError(
+                f"max_block_size ({max_block_size}) must be >= min_block_size ({min_block_size})"
+            )
+        # max_block_size is checked against the SMALLEST axis to guarantee
+        # the cuboid fits in every axis.
+        if max_block_size > min(gd, gh, gw):
+            raise ValueError(
+                f"max_block_size ({max_block_size}) must be <= min(grid axes) "
+                f"= {min(gd, gh, gw)}; grid axes={self.grid_size_dhw}"
+            )
+
+        # Legacy scalar alias used by some downstream code (largest axis).
+        self.grid_size = max(self.grid_size_dhw)
+        self.context_ratio = context_ratio
+        self.min_block_size = min_block_size
+        self.max_block_size = max_block_size
+        self.total_patches = gd * gh * gw
+
+        target_ratio = 1.0 - context_ratio
+        target_patches_desired = self.total_patches * target_ratio
+        ideal_dim = target_patches_desired ** (1.0 / 3.0)
+        self._ideal_block_dim = max(min_block_size, min(max_block_size, ideal_dim))
+
+    def sample_mask(
+        self,
+        batch_size: int,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        gd, gh, gw = self.grid_size_dhw
+        target_ratio = 1.0 - self.context_ratio
+        target_patches_desired = self.total_patches * target_ratio
+        ideal_dim = target_patches_desired ** (1.0 / 3.0)
+
+        # Compute per-axis effective bounds so we don't draw a block bigger
+        # than the smallest axis on that axis.
+        def axis_bounds(g_axis):
+            emin = max(self.min_block_size, int(ideal_dim * 0.7))
+            emax = min(self.max_block_size, int(ideal_dim * 1.3) + 1, g_axis)
+            emin = min(emin, emax)
+            return emin, emax
+
+        emin_d, emax_d = axis_bounds(gd)
+        emin_h, emax_h = axis_bounds(gh)
+        emin_w, emax_w = axis_bounds(gw)
+
+        context_indices_list = []
+        target_indices_list = []
+
+        for _ in range(batch_size):
+            bd = torch.randint(emin_d, emax_d + 1, (1,)).item()
+            bh = torch.randint(emin_h, emax_h + 1, (1,)).item()
+            bw = torch.randint(emin_w, emax_w + 1, (1,)).item()
+
+            d0 = torch.randint(0, gd - bd + 1, (1,)).item()
+            h0 = torch.randint(0, gh - bh + 1, (1,)).item()
+            w0 = torch.randint(0, gw - bw + 1, (1,)).item()
+
+            mask_grid = torch.zeros(gd, gh, gw, dtype=torch.bool)
+            mask_grid[d0:d0 + bd, h0:h0 + bh, w0:w0 + bw] = True
+
+            mask_flat = mask_grid.flatten()
+            all_indices = torch.arange(self.total_patches)
+
+            target_idx = all_indices[mask_flat]
+            context_idx = all_indices[~mask_flat]
+
+            target_indices_list.append(target_idx)
+            context_indices_list.append(context_idx)
+
+        max_target_len = max(t.shape[0] for t in target_indices_list)
+        max_context_len = max(c.shape[0] for c in context_indices_list)
+
+        target_padded = torch.full((batch_size, max_target_len), -1, dtype=torch.long)
+        context_padded = torch.full((batch_size, max_context_len), -1, dtype=torch.long)
+
+        for i, (t_idx, c_idx) in enumerate(zip(target_indices_list, context_indices_list)):
+            target_padded[i, :t_idx.shape[0]] = t_idx
+            context_padded[i, :c_idx.shape[0]] = c_idx
+
+        return context_padded.to(device), target_padded.to(device)
+
+    def get_positional_encoding(
+        self,
+        target_idx: torch.Tensor,
+        embed_dim: int,
+    ) -> torch.Tensor:
+        """Sinusoidal positional encodings for 3D patch indices.
+
+        Splits embed_dim into 6 chunks: sin/cos for each of d, h, w.
+        """
+        if embed_dim % 6 != 0:
+            raise ValueError(f"embed_dim must be divisible by 6 for 3D pos enc, got {embed_dim}")
+
+        device = target_idx.device
+        valid_mask = target_idx >= 0
+        safe_idx = target_idx.clamp(min=0)
+
+        # Decompose flat index into (d, h, w) using the actual grid axes.
+        gd, gh, gw = self.grid_size_dhw
+        d_idx = safe_idx // (gh * gw)
+        rem = safe_idx % (gh * gw)
+        h_idx = rem // gw
+        w_idx = rem % gw
+
+        d_norm = d_idx.float() / max(gd - 1, 1)
+        h_norm = h_idx.float() / max(gh - 1, 1)
+        w_norm = w_idx.float() / max(gw - 1, 1)
+
+        dim_per = embed_dim // 6
+        freq_bands = torch.arange(dim_per, device=device, dtype=torch.float32)
+        freq_bands = 10000 ** (-freq_bands / dim_per)
+
+        d_pos = d_norm.unsqueeze(-1) * math.pi * freq_bands
+        h_pos = h_norm.unsqueeze(-1) * math.pi * freq_bands
+        w_pos = w_norm.unsqueeze(-1) * math.pi * freq_bands
+
+        enc = torch.cat([
+            torch.sin(d_pos), torch.cos(d_pos),
+            torch.sin(h_pos), torch.cos(h_pos),
+            torch.sin(w_pos), torch.cos(w_pos),
+        ], dim=-1)
+
+        enc = enc * valid_mask.unsqueeze(-1).float()
+        return enc
+
+    def get_context_ratio_actual(self, context_idx: torch.Tensor) -> float:
+        valid_counts = (context_idx >= 0).sum(dim=1).float()
+        return (valid_counts / self.total_patches).mean().item()

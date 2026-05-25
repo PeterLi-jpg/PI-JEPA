@@ -120,12 +120,19 @@ class LossBuilder(nn.Module):
         if loss_cfg["physics"].get("enabled", False):
             self.physics_loss_fn = PhysicsLoss(config)
 
+        # Loss weights pulled directly from config. The legacy LossBuilder
+        # used to coerce cov→max(5.0, ...) and multiply physics by ×5; both
+        # silently overrode the configured values. Removed to keep config
+        # the single source of truth.
         self.weights = {
             "pred": loss_cfg["prediction"]["weight"],
             "var": loss_cfg["regularization"]["variance"]["weight"],
-            "cov": max(5.0, loss_cfg["regularization"]["covariance"]["weight"]),
-            "physics": loss_cfg["physics"]["weight"]
+            "cov": loss_cfg["regularization"]["covariance"]["weight"],
+            "physics": loss_cfg["physics"]["weight"],
         }
+        # Cache these so forward() doesn't need the full config closure.
+        self._recon_weight = float(loss_cfg.get("reconstruction", {}).get("weight", 0.0))
+        self._physics_ramp_steps = float(loss_cfg.get("physics", {}).get("ramp_steps", 200))
 
         self.step = 0
 
@@ -168,12 +175,16 @@ class LossBuilder(nn.Module):
             self.weights["cov"] * losses["covariance"]
         )
 
-        if "recon" in losses:
-            total += 0.5 * losses["recon"]
+        # Optional reconstruction term, gated by config weight (not hardcoded).
+        if "recon" in losses and self._recon_weight > 0:
+            total += self._recon_weight * losses["recon"]
 
         if "physics" in losses:
-            physics_weight = self.weights["physics"] * min(1.0, self.step / 200)
-            total += physics_weight * 5.0 * losses["physics"]
+            # Ramp weight fully governed by config.
+            physics_weight = self.weights["physics"] * min(
+                1.0, self.step / max(self._physics_ramp_steps, 1)
+            )
+            total += physics_weight * losses["physics"]
 
         losses["total"] = total
 

@@ -193,10 +193,21 @@ class SelfSupervisedPretrainer:
             device: Training device
         """
         self.model = model.to(device)
-        self.decoder = decoder.to(device)
+        # `decoder` may be a single Decoder/Decoder3D (legacy) or an
+        # nn.ModuleList of K decoders (one per predictor sub-operator).
+        if isinstance(decoder, nn.ModuleList):
+            self.decoders = decoder.to(device)
+            # Back-compat: also expose self.decoder pointing at the first one.
+            self.decoder = self.decoders[0]
+        else:
+            self.decoder = decoder.to(device)
+            # Build a length-K view onto the single decoder so the train loop
+            # can iterate uniformly. The same decoder is shared across stages.
+            K = len(self.model.predictors)
+            self.decoders = nn.ModuleList([self.decoder] * K).to(device)
         self.config = config
         self.device = device
-        
+
         # Build masker
         self.masker = build_spatial_block_masker(config)
         
@@ -246,11 +257,13 @@ class SelfSupervisedPretrainer:
         weight_decay = float(optim_cfg.get("weight_decay", 5e-2))
         betas = tuple(optim_cfg.get("betas", [0.9, 0.95]))
         
-        # Only train encoder, predictors, and decoder (not target_encoder)
+        # Only train encoder, predictors, and decoder(s) (not target_encoder).
+        # Use self.decoders (always a ModuleList) so per-stage decoders are
+        # all registered when per_stage=True.
         params = (
             list(self.model.encoder.parameters()) +
             list(self.model.predictors.parameters()) +
-            list(self.decoder.parameters())
+            list(self.decoders.parameters())
         )
         
         return optim.AdamW(
@@ -264,156 +277,139 @@ class SelfSupervisedPretrainer:
         self,
         x: torch.Tensor,
         context_idx: torch.Tensor,
-        target_idx: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        target_idx: torch.Tensor,
+    ):
         """
         Forward pass for self-supervised pretraining.
-        
+
+        Uses PIJEPA.forward_operator_split which implements the true
+        Lie-Trotter chain: each predictor stage refines the previous stage's
+        output (not a fresh mask token), so K predictors really do encode K
+        sub-operators of the splitting decomposition.
+
         Args:
-            x: (B, 1, H, W) coefficient field (single channel)
+            x: (B, 1, H, W) or (B, 1, D, H, W) coefficient field
             context_idx: (B, N_c) context patch indices
-            target_idx: (B, N_t) target patch indices
-            
+            target_idx:  (B, N_t) target patch indices (may contain -1 padding)
+
         Returns:
-            z_pred: (B, N_t, D) predicted target embeddings
-            z_target: (B, N_t, D) EMA target embeddings (detached)
-            z_full: (B, N, D) full encoded representation
+            z_pred:        (B, N_t, D) — final stage output (for JEPA loss)
+            z_target:      (B, N_t, D) — EMA target embedding (detached)
+            z_full:        (B, N, D)   — full encoder output (for decoding)
+            stage_outputs: list[(B, N_t, D)] of length K — per-sub-operator predictions
         """
-        B = x.shape[0]
-        
-        # Encode full field with target encoder (EMA, stop gradient)
-        # AC 1.5: Target_Encoder processes full coefficient field
-        with torch.no_grad():
-            z_target_full = self.model.target_encoder(x)
-        
-        # Get number of patches from encoder output
-        num_patches = z_target_full.shape[1]
-        
-        # AC 1.3: Apply spatial masking to partition coefficient field
-        # Handle padded indices (-1) and clamp to valid range
-        target_idx_safe = target_idx.clamp(min=0, max=num_patches - 1)
-        x_masked = self.model.mask_input(x, target_idx_safe)
-        
-        # Encode masked input with context encoder
-        # AC 1.4: Context_Encoder processes only context patches
-        z_full = self.model.encoder(x_masked)
-        
-        # Verify encoder output matches expected number of patches
-        assert z_full.shape[1] == num_patches, f"Encoder output mismatch: {z_full.shape[1]} vs {num_patches}"
-        
-        # Replace target positions with mask tokens
-        z = z_full.clone()
-        mask_tokens = self.model.mask_token.expand(
-            B, target_idx.shape[1], self.model.embed_dim
+        # The target/context indices may contain -1 padding sentinels.
+        # Determine num_patches from the encoder by encoding once.
+        # Defer that to PIJEPA.forward_operator_split, which will (a) encode
+        # via target_encoder under no_grad, (b) build z_context, (c) chain
+        # the predictors with mask-token init.
+        # Pre-clamp -1 padding to a valid range.
+        # (The clamp is conservative: max index across both ctx and tgt.)
+        max_idx = int(max(
+            int(target_idx.max().item()) if target_idx.numel() > 0 else -1,
+            int(context_idx.max().item()) if context_idx.numel() > 0 else -1,
+        ))
+        # We don't yet know num_patches; we'll just clamp negatives to 0 for
+        # safety. The model's own ValueError check inside mask_input will
+        # catch true mismatches.
+        target_idx_safe = target_idx.clamp(min=0)
+        context_idx_safe = context_idx.clamp(min=0)
+
+        splitting = (
+            self.config.get("model", {}).get("predictor", {}).get("splitting", "lie_trotter")
         )
-        
-        # Handle padded indices (-1) and clamp to valid range
-        valid_mask = target_idx >= 0
-        
-        # Scatter mask tokens to target positions using safe indexing
-        for b in range(B):
-            valid_targets = target_idx[b][valid_mask[b]]
-            if len(valid_targets) > 0:
-                # Clamp indices to valid range for this encoder output
-                valid_targets_clamped = valid_targets.clamp(0, num_patches - 1)
-                z[b, valid_targets_clamped] = mask_tokens[b, :len(valid_targets)]
-        
-        # AC 1.6: Latent_Predictor predicts target embeddings from context
-        # Use safe indices for predictor operations
-        context_idx_safe = context_idx.clamp(min=0, max=num_patches - 1)
-        
-        for predictor in self.model.predictors:
-            z_delta, _ = predictor(z, context_idx_safe, target_idx_safe)
-            
-            # Gather old values at target positions
-            z_old = torch.gather(
-                z, 1,
-                target_idx_safe.unsqueeze(-1).expand(-1, -1, self.model.embed_dim)
-            )
-            
-            # Residual update
-            z_new = z_old + 0.5 * z_delta
-            
-            # Scatter back
-            z = z.scatter(
-                1,
-                target_idx_safe.unsqueeze(-1).expand(-1, -1, self.model.embed_dim),
-                z_new
-            )
-        
-        # Gather predicted target embeddings
-        z_pred = torch.gather(
-            z, 1,
-            target_idx_safe.unsqueeze(-1).expand(-1, -1, self.model.embed_dim)
+        z_pred, z_target, stage_outputs, z_full = self.model.forward_operator_split(
+            x, context_idx_safe, target_idx_safe, splitting=splitting
         )
-        
-        # Gather target embeddings from EMA encoder
-        z_target = torch.gather(
-            z_target_full, 1,
-            target_idx_safe.unsqueeze(-1).expand(-1, -1, self.model.embed_dim)
-        )
-        
-        # Normalize embeddings
-        z_pred = F.layer_norm(z_pred, (self.model.embed_dim,))
-        z_target = F.layer_norm(z_target, (self.model.embed_dim,))
-        
-        return z_pred, z_target.detach(), z_full
+
+        return z_pred, z_target, z_full, stage_outputs
     
     def _compute_physics_residual(
         self,
         z_decoded: torch.Tensor,
-        coefficient_field: torch.Tensor
+        coefficient_field: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Compute Darcy PDE residual: -∇·(K ∇p) ≈ 0.
+        Compute the steady-state single-phase Darcy PDE residual:
+            -∇·(K ∇p) ≈ 0
+        for both 2D (4D tensors) and 3D (5D tensors).
 
         The decoder output is treated as a candidate pressure field p.
-        The coefficient field is the permeability K.  Penalising the
-        residual forces the latent space to encode information that is
-        physically consistent with the governing PDE.
+        The coefficient field is the permeability K. Penalising the residual
+        forces the latent space to encode information that is physically
+        consistent with the governing PDE.
 
         Args:
-            z_decoded: (B, C, H, W) decoded field — treated as pressure p
-            coefficient_field: (B, 1, H, W) permeability K
+            z_decoded:        (B, C, H, W) or (B, C, D, H, W) decoded field
+            coefficient_field: (B, 1, H, W) or (B, 1, D, H, W) permeability K
 
         Returns:
-            Scalar physics residual loss
+            Scalar physics residual loss (PDE residual + small smoothness term).
         """
-        from physics.darcy import grad_x, grad_y, divergence
-
-        # Use first channel of decoded output as pressure
+        # First channel of decoded output = candidate pressure
         p = z_decoded[:, 0:1]
 
-        # Match spatial resolution
-        if p.shape[-2:] != coefficient_field.shape[-2:]:
-            p = F.interpolate(
-                p, size=coefficient_field.shape[-2:],
-                mode='bilinear', align_corners=False
-            )
+        # Resample p to the coefficient grid if shapes differ (decoder may
+        # over-resolve via patchwise unprojection).
+        if p.shape[-len(coefficient_field.shape[2:]):] != coefficient_field.shape[2:]:
+            target_size = coefficient_field.shape[2:]
+            mode = 'trilinear' if len(target_size) == 3 else 'bilinear'
+            p = F.interpolate(p, size=target_size, mode=mode, align_corners=False)
 
-        K = coefficient_field  # (B, 1, H, W)
-
+        K = coefficient_field
         physics_cfg = self.config.get("physics", {})
         dx = float(physics_cfg.get("dx", 1.0))
         dy = float(physics_cfg.get("dy", 1.0))
 
-        # Darcy flux: q = -K ∇p
-        dp_dx = grad_x(p, dx)
-        dp_dy = grad_y(p, dy)
+        # Choose finite-difference vs spectral derivatives based on config.
+        # Default: "fd" — matches the original PI-JEPA paper's behavior (which
+        # the paper itself found neutral-to-harmful). "spectral" uses exact
+        # FFT-based derivatives, which is the paper-contribution-(iii) fix.
+        residual_type = str(physics_cfg.get("residual_type", "fd")).lower()
 
-        flux_x = -K * dp_dx
-        flux_y = -K * dp_dy
+        if p.dim() == 4:
+            # 2D path
+            if residual_type == "spectral":
+                from physics.darcy import _spectral_grad_2d, spectral_darcy_residual_2d
+                dp_dx, dp_dy = _spectral_grad_2d(p, dx, dy)
+                residual = spectral_darcy_residual_2d(p, K, q=None, dx=dx, dy=dy)
+            else:
+                from physics.darcy import grad_x, grad_y, divergence
+                dp_dx = grad_x(p, dx)
+                dp_dy = grad_y(p, dy)
+                flux_x = -K * dp_dx
+                flux_y = -K * dp_dy
+                residual = divergence(flux_x, flux_y, dx, dy)
+            grad_norm = (dp_dx ** 2 + dp_dy ** 2).mean()
 
-        # Residual: -∇·(K ∇p) = ∇·q  (should be ≈ 0 for steady-state)
-        residual = divergence(flux_x, flux_y, dx, dy)
+        elif p.dim() == 5:
+            # 3D path
+            dz = float(physics_cfg.get("dz", 1.0))
+            if residual_type == "spectral":
+                from physics.darcy import _spectral_grad_3d, spectral_darcy_residual_3d
+                dp_dx, dp_dy, dp_dz = _spectral_grad_3d(p, dx, dy, dz)
+                residual = spectral_darcy_residual_3d(p, K, q=None, dx=dx, dy=dy, dz=dz)
+            else:
+                from physics.darcy import grad_x_3d, grad_y_3d, grad_z_3d, divergence_3d
+                dp_dx = grad_x_3d(p, dx)
+                dp_dy = grad_y_3d(p, dy)
+                dp_dz = grad_z_3d(p, dz)
+                flux_x = -K * dp_dx
+                flux_y = -K * dp_dy
+                flux_z = -K * dp_dz
+                residual = divergence_3d(flux_x, flux_y, flux_z, dx, dy, dz)
+            grad_norm = (dp_dx ** 2 + dp_dy ** 2 + dp_dz ** 2).mean()
+        else:
+            raise ValueError(
+                f"_compute_physics_residual expects 4D or 5D decoded field; got dim={p.dim()}"
+            )
 
         pde_loss = (residual ** 2).mean()
-
-        # Mild gradient norm penalty to keep decoded field smooth
-        # (replaces the old recon_loss that incorrectly pushed p toward K)
-        grad_norm = (dp_dx ** 2 + dp_dy ** 2).mean()
-        smoothness_loss = 0.01 * grad_norm
-
+        # smoothness regularizer to prevent the decoder from over-fitting
+        # high-frequency garbage; weight is config-driven so the ablation
+        # can sweep it (paper's "no smoothness" row).
+        smoothness_weight = float(physics_cfg.get("smoothness_weight", 0.01))
+        smoothness_loss = smoothness_weight * grad_norm
         return pde_loss + smoothness_loss
     
     def pretrain(
@@ -476,36 +472,76 @@ class SelfSupervisedPretrainer:
                 # AC 1.3: Sample spatial block mask
                 context_idx, target_idx = self.masker.sample_mask(B, self.device)
                 
-                # Forward pass
-                z_pred, z_target, z_full = self._forward_pretraining(
+                # Forward pass (true Lie-Trotter chain via forward_operator_split)
+                z_pred, z_target, z_full, stage_outputs = self._forward_pretraining(
                     x, context_idx, target_idx
                 )
-                
+
                 # AC 1.7: Compute JEPA loss (L2 with stop-gradient on target)
                 jepa_loss = compute_jepa_loss(z_pred, z_target, normalize=True)
-                
-                # AC 2.5: VICReg regularization
+
+                # AC 2.5: VICReg regularization on final stage prediction
                 vicreg_losses = self.vicreg_loss(z_pred)
-                
+
                 # Total loss
                 total_loss = jepa_loss + vicreg_losses['total']
-                
-                # AC 2.1, 2.3: Optional physics residual with ramping
-                if physics_enabled:
-                    # Decode predicted embeddings
+
+                # Multi-fidelity Tier-1 continuation: if this batch has a
+                # coarse-solver target field, add a reconstruction loss
+                # against the FINAL stage's decoded output. This gives the
+                # encoder + decoders cheap weak supervision from coarse sims
+                # without ever touching the expensive Tier-2 simulator.
+                y_coarse = batch.get("y_coarse")
+                if y_coarse is not None:
+                    y_coarse = y_coarse.to(self.device).float()
+                    # Decode the final stage at every target patch + leave
+                    # context patches as encoded. This mirrors the physics
+                    # decoding path below.
                     z_recon = z_full.clone()
-                    z_recon = z_recon.scatter(
-                        1,
-                        target_idx.clamp(min=0).unsqueeze(-1).expand(-1, -1, self.model.embed_dim),
-                        z_pred
+                    target_idx_safe = target_idx.clamp(min=0)
+                    expand_target = target_idx_safe.unsqueeze(-1).expand(-1, -1, self.model.embed_dim)
+                    z_recon = z_recon.scatter(1, expand_target, z_pred)
+                    # Final-stage decoder (always exists; per-stage or shared)
+                    x_decoded_final = self.decoders[-1](z_recon)
+                    # Match the spatial shape of y_coarse if encoder/decoder
+                    # imply a different resolution.
+                    if x_decoded_final.shape[-len(y_coarse.shape[2:]):] != y_coarse.shape[2:]:
+                        x_decoded_final = F.interpolate(
+                            x_decoded_final, size=y_coarse.shape[2:],
+                            mode="trilinear" if y_coarse.dim() == 5 else "bilinear",
+                            align_corners=False,
+                        )
+                    mf_weight = float(
+                        self.config.get("pretraining", {}).get("multifidelity", {}).get("weight", 0.5)
                     )
-                    x_decoded = self.decoder(z_recon)
-                    
-                    physics_loss = self._compute_physics_residual(x_decoded, x)
+                    mf_loss = F.mse_loss(x_decoded_final[:, :y_coarse.shape[1]], y_coarse)
+                    total_loss = total_loss + mf_weight * mf_loss
+                    epoch_losses['mf_recon'] = epoch_losses.get('mf_recon', 0) + mf_loss.item()
+                    epoch_losses['mf_weight'] = mf_weight
+
+                # AC 2.1, 2.3: Optional per-sub-operator physics residuals with ramping.
+                # For each predictor stage k, decode ẑ^(k) back to physical space and
+                # evaluate the k-th sub-operator residual. Sum over K stages (paper Eq. 6).
+                if physics_enabled:
                     physics_weight = self.physics_schedule.get_weight(self.global_step)
-                    total_loss = total_loss + physics_weight * physics_loss
-                    
-                    epoch_losses['physics'] = epoch_losses.get('physics', 0) + physics_loss.item()
+                    decoders = getattr(self, 'decoders', None)
+                    if decoders is None:
+                        decoders = [self.decoder] * len(stage_outputs)
+
+                    physics_loss_total = 0.0
+                    target_idx_safe = target_idx.clamp(min=0)
+                    expand_target = target_idx_safe.unsqueeze(-1).expand(-1, -1, self.model.embed_dim)
+
+                    for k, (z_k, dec_k) in enumerate(zip(stage_outputs, decoders)):
+                        z_recon = z_full.clone()
+                        z_recon = z_recon.scatter(1, expand_target, z_k)
+                        x_decoded_k = dec_k(z_recon)
+                        physics_loss_k = self._compute_physics_residual(x_decoded_k, x)
+                        physics_loss_total = physics_loss_total + physics_loss_k
+                        epoch_losses[f'physics_k{k}'] = epoch_losses.get(f'physics_k{k}', 0) + physics_loss_k.item()
+
+                    total_loss = total_loss + physics_weight * physics_loss_total
+                    epoch_losses['physics'] = epoch_losses.get('physics', 0) + float(physics_loss_total) if not isinstance(physics_loss_total, torch.Tensor) else epoch_losses.get('physics', 0) + physics_loss_total.item()
                     epoch_losses['physics_weight'] = physics_weight
                 
                 # Backward pass
@@ -517,7 +553,7 @@ class SelfSupervisedPretrainer:
                     torch.nn.utils.clip_grad_norm_(
                         list(self.model.encoder.parameters()) +
                         list(self.model.predictors.parameters()) +
-                        list(self.decoder.parameters()),
+                        list(self.decoders.parameters()),
                         grad_clip
                     )
                 
@@ -598,13 +634,17 @@ class SelfSupervisedPretrainer:
             'encoder_state_dict': self.model.encoder.state_dict(),
             'target_encoder_state_dict': self.model.target_encoder.state_dict(),
             'predictor_state_dicts': [p.state_dict() for p in self.model.predictors],
-            'decoder_state_dict': self.decoder.state_dict(),
+            # Save BOTH the legacy single-decoder field (first decoder) and the
+            # full per-stage list. Old loaders that only look at 'decoder_state_dict'
+            # still work; new loaders pick up 'decoder_state_dicts'.
+            'decoder_state_dict': self.decoders[0].state_dict(),
+            'decoder_state_dicts': [d.state_dict() for d in self.decoders],
             'optimizer_state_dict': optimizer.state_dict(),
             'epoch': self.epoch,
             'global_step': self.global_step,
             'ema_tau': self.ema_schedule.get_tau(self.epoch),
             'config': self.config,
-            'metrics': metrics
+            'metrics': metrics,
         }
         
         os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
@@ -631,9 +671,14 @@ def build_model_for_pretraining(
     Returns:
         Tuple of (PIJEPA model, Decoder)
     """
-    # Build encoder using factory (supports vit, fourier, multiscale_fourier)
-    encoder = build_encoder(config, in_channels=1).to(device)
-    target_encoder = build_encoder(config, in_channels=1).to(device)
+    # Build encoder using factory (supports vit, fourier, multiscale_fourier).
+    # Read in_channels from config (CCSNet=1, FNO4CO2=12, ADR=n_species, etc.)
+    in_channels = int(
+        config.get("model", {}).get("encoder", {}).get("in_channels", 1)
+    )
+    encoder = build_encoder(config, in_channels=in_channels).to(device)
+    target_encoder = build_encoder(config, in_channels=in_channels).to(device)
+    print(f"  [encoder] in_channels={in_channels}")
     
     # Build predictors
     predictors = [
@@ -656,15 +701,46 @@ def build_model_for_pretraining(
         p.requires_grad = False
     target_encoder.load_state_dict(encoder.state_dict())
     
-    # Build decoder
+    # Build decoder(s). For operator-split pretraining we want K decoders
+    # (one per predictor sub-operator). The K decoders are independent params:
+    # each one maps the k-th stage's latent back to physical space so that
+    # the k-th sub-operator's PDE residual can be evaluated on its own
+    # decoded field. If decoder.per_stage is false, a single shared decoder
+    # is used and the trainer broadcasts it across stages.
     decoder_cfg = config.get("decoder", {})
-    decoder = Decoder(
-        embed_dim=decoder_cfg.get("embed_dim", config["model"]["encoder"]["embed_dim"]),
-        out_channels=decoder_cfg.get("out_channels", 1),  # Single channel for pretraining
-        image_size=decoder_cfg.get("image_size", config["model"]["encoder"]["image_size"]),
-        patch_size=decoder_cfg.get("patch_size", config["model"]["encoder"]["patch_size"])
-    ).to(device)
-    
+    encoder_type = config.get("model", {}).get("encoder", {}).get("type", "vit").lower()
+    embed_dim = decoder_cfg.get("embed_dim", config["model"]["encoder"]["embed_dim"])
+    out_channels = decoder_cfg.get("out_channels", 1)
+    image_size = decoder_cfg.get("image_size", config["model"]["encoder"]["image_size"])
+    patch_size = decoder_cfg.get("patch_size", config["model"]["encoder"]["patch_size"])
+    per_stage = bool(decoder_cfg.get("per_stage", True))  # default to per-sub-op decoders
+    K = int(config["model"]["num_predictors"])
+
+    is_3d = encoder_type in ("fourier_3d", "fourier3d")
+
+    def _make_one():
+        if is_3d:
+            from models import Decoder3D
+            return Decoder3D(
+                embed_dim=embed_dim,
+                out_channels=out_channels,
+                image_size=image_size,
+                patch_size=patch_size,
+            )
+        return Decoder(
+            embed_dim=embed_dim,
+            out_channels=out_channels,
+            image_size=image_size,
+            patch_size=patch_size,
+        )
+
+    if per_stage and K > 1:
+        decoder = nn.ModuleList([_make_one() for _ in range(K)]).to(device)
+        print(f"  [decoder] Built {K} per-stage decoders (per_stage=True)")
+    else:
+        decoder = _make_one().to(device)
+        print(f"  [decoder] Built 1 shared decoder (per_stage={per_stage}, K={K})")
+
     return model, decoder
 
 
@@ -684,18 +760,151 @@ def build_unlabeled_dataloader(
     """
     pretraining_cfg = config.get("pretraining", {})
     data_cfg = config.get("data", {})
-    
+    ndim = int(data_cfg.get("ndim", 2))
+    dataset_name = data_cfg.get("dataset", "darcy_flow").lower()
+
+    batch_size = pretraining_cfg.get("batch_size", config.get("training", {}).get("batch_size", 64))
+
+    # Multi-fidelity Darcy branch — mixes Tier-0 (unlabeled fields) with
+    # Tier-1 (coarse-grid simulations). Tier-1 batches carry y_coarse.
+    if dataset_name in ("darcy_3d_mf", "darcy3d_mf", "multifidelity"):
+        from data.multifidelity import (
+            DarcyTier1Dataset,
+            build_multifidelity_loader,
+        )
+        mf_cfg = data_cfg.get("multifidelity", {})
+        tier0_path = mf_cfg.get("tier0_path", "data/darcy_3d/darcy3d_train.pt")
+        tier1_path = mf_cfg.get("tier1_path", "data/darcy_3d_tier1/darcy3d_tier1.pt")
+        # Reuse the simple dict-yielding Tier-0 dataset built inline below.
+        tier0_blob = torch.load(tier0_path, weights_only=False)
+        x0 = tier0_blob["x"]
+        n_tier0 = pretraining_cfg.get("n_unlabeled", x0.shape[0])
+        x0 = x0[:n_tier0].float()
+
+        class _Tier0Dict(torch.utils.data.Dataset):
+            def __init__(self, x):
+                self.x = x
+            def __len__(self):
+                return self.x.shape[0]
+            def __getitem__(self, i):
+                return {"x": self.x[i]}
+
+        tier0_ds = _Tier0Dict(x0)
+        tier1_ds = DarcyTier1Dataset(
+            pt_path=tier1_path,
+            n_samples=mf_cfg.get("n_tier1", None),
+        )
+        loader = build_multifidelity_loader(
+            tier0_dataset=tier0_ds,
+            tier1_dataset=tier1_ds,
+            batch_size=batch_size,
+            shuffle=True,
+            tier1_weight=mf_cfg.get("tier1_weight", 0.5),
+        )
+        print(f"  [unlabeled loader] Multi-fidelity Darcy: "
+              f"Tier0={len(tier0_ds)} samples, Tier1={len(tier1_ds)} samples")
+        return loader
+
+    # FNO4CO2 / U-FNO branch
+    if dataset_name in ("fno4co2", "ufno"):
+        from data.fno4co2_loader import load_fno4co2_unlabeled
+
+        root = data_cfg.get("path", "data/fno4co2/dataset")
+        fno_cfg = data_cfg.get("fno4co2", {})
+        resize_to = fno_cfg.get("resize_to")
+        if resize_to is not None:
+            resize_to = tuple(resize_to)
+        if ndim == 3:
+            t_index = fno_cfg.get("t_index", None)
+        else:
+            t_index = int(fno_cfg.get("t_index", 0))
+        keep_channels = fno_cfg.get("keep_channels")
+        if keep_channels is not None:
+            keep_channels = tuple(int(c) for c in keep_channels)
+        loader = load_fno4co2_unlabeled(
+            root=root,
+            variant=fno_cfg.get("variant", "dP"),
+            split=fno_cfg.get("split", "test"),
+            n_samples=pretraining_cfg.get("n_unlabeled", None),
+            t_index=t_index,
+            normalize=data_cfg.get("normalize", True),
+            batch_size=batch_size,
+            shuffle=True,
+            resize_to=resize_to,
+            layout=fno_cfg.get("layout", "ctxy"),
+            keep_channels=keep_channels,
+        )
+        print(f"  [unlabeled loader] FNO4CO2: {len(loader.dataset)} samples (ndim={ndim}, t_index={t_index})")
+        return loader
+
+    # CCSNet branch — uses the dedicated loader in PI-JEPA/data/ccsnet_loader.py
+    if dataset_name == "ccsnet":
+        from data.ccsnet_loader import load_ccsnet_unlabeled
+
+        root = data_cfg.get("path", "data/ccsnet/CCSNet_v1.0")
+        ccs_cfg = data_cfg.get("ccsnet", {})
+        resize_to = ccs_cfg.get("resize_to")
+        if resize_to is not None:
+            resize_to = tuple(resize_to)
+        # If ndim==3 in data config, default to keeping the time axis so the
+        # samples come out as (C, T, H, W) for the 3D encoder.
+        if ndim == 3:
+            t_index = ccs_cfg.get("t_index", None)   # None -> keep all timesteps
+        else:
+            t_index = int(ccs_cfg.get("t_index", 0))
+        loader = load_ccsnet_unlabeled(
+            root=root,
+            split=ccs_cfg.get("split", "test"),
+            n_samples=pretraining_cfg.get("n_unlabeled", None),
+            t_index=t_index,
+            normalize=data_cfg.get("normalize", True),
+            batch_size=batch_size,
+            shuffle=True,
+            resize_to=resize_to,
+            layout=ccs_cfg.get("layout", "ctxy"),
+        )
+        print(f"  [unlabeled loader] CCSNet: {len(loader.dataset)} samples (ndim={ndim}, t_index={t_index})")
+        return loader
+
+    if ndim == 3:
+        # 3D path: load the .pt file produced by scripts/generate_darcy_data_3d.py
+        # and wrap as a tiny dict-yielding dataset.
+        data_path = data_cfg.get("path", "data/darcy_3d")
+        pt_path = os.path.join(data_path, "darcy3d_train.pt")
+        blob = torch.load(pt_path, weights_only=False)
+        x = blob["x"]  # (N, 1, D, H, W)
+        n_samples = pretraining_cfg.get("n_unlabeled", x.shape[0])
+        x = x[:n_samples].float()
+
+        class _Dict3DDataset(torch.utils.data.Dataset):
+            def __init__(self, x):
+                self.x = x
+            def __len__(self):
+                return self.x.shape[0]
+            def __getitem__(self, i):
+                return {"x": self.x[i]}
+
+        dataset = _Dict3DDataset(x)
+        print(f"  [unlabeled loader] 3D: {len(dataset)} samples, shape per item {tuple(x[0].shape)}")
+
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=0,
+            pin_memory=True if torch.cuda.is_available() else False,
+        )
+
+    # 2D default path (unchanged)
     dataset_config = {
         'path': data_cfg.get("path", ""),
         'n_samples': pretraining_cfg.get("n_unlabeled", 1000),
         'resolution': data_cfg.get("grid_size", 64),
         'normalize': data_cfg.get("normalize", True)
     }
-    
+
     dataset = UnlabeledDarcyDataset(config=dataset_config, split=split)
-    
-    batch_size = pretraining_cfg.get("batch_size", config.get("training", {}).get("batch_size", 64))
-    
+
     return DataLoader(
         dataset,
         batch_size=batch_size,

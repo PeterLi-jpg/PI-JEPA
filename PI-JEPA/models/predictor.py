@@ -212,6 +212,13 @@ class Predictor(nn.Module):
         nn.init.normal_(self.mask_token, std=0.02)
 
     def forward(self, z_full, context_idx, target_idx):
+        """Original forward used by 2D path. Gathers context+target from z_full,
+        OVERWRITES target with mask_token, then refines via internal stages.
+
+        Known limitation: when multiple Predictor instances are chained externally,
+        each call to this forward discards the previous predictor's output. Use
+        forward_chained() below for true Lie-Trotter operator-splitting chains.
+        """
         B, N, D = z_full.shape
 
         z_context = torch.gather(
@@ -238,6 +245,35 @@ class Predictor(nn.Module):
             stage_outputs[f"stage_{i}"] = z_target
 
         return z_target, stage_outputs
+
+    def forward_chained(self, z_target_in, z_context):
+        """True chained forward for operator-splitting.
+
+        Refines an existing target representation `z_target_in` conditioned on
+        the context `z_context`, without overwriting the input. Returns the
+        refined (B, N_t, D) tensor.
+
+        Use this for the Lie-Trotter / Strang chain across multiple predictors:
+            z_t = mask_token.expand(...)
+            for k, pred in enumerate(predictors):
+                z_t = pred.forward_chained(z_t, z_context)
+                stage_outputs.append(z_t)
+        """
+        z_target = z_target_in
+        for stage in self.stages:
+            z_delta = stage(z_target, z_context)
+            z_target = z_target + z_delta
+        return z_target
+
+    def init_mask_tokens(self, B: int, N_t: int, device, dtype=None) -> torch.Tensor:
+        """Initialize a (B, N_t, D) tensor from this predictor's mask_token.
+
+        Used to seed the chain at predictor k=0.
+        """
+        z = self.mask_token.expand(B, N_t, -1).clone()
+        if dtype is not None:
+            z = z.to(dtype=dtype)
+        return z.to(device)
 
     def rollout(self, z0, steps):
         traj = []

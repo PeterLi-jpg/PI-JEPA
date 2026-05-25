@@ -1,0 +1,149 @@
+# =============================================================================
+# CCSNet smoke test using the TRUE U-FNO 3D treatment:
+# tensor (B, C, T, H, W) processed as a 3D volume by FourierJEPAEncoder3D.
+# Native CCSNet spatial is 96x200; we crop W -> 96 for cubic-ish for now
+# (independent of axis sizes; rectangular grid is supported but smaller W
+# keeps the smoke test fast).
+# =============================================================================
+
+problem:
+  type: steady_state
+
+experiment:
+  name: pi_jepa_ccsnet_3d_smoke
+  seed: 42
+  device: null
+  precision: fp32
+  deterministic: false
+
+data:
+  dataset: ccsnet
+  path: data/ccsnet/CCSNet_v1.0
+  ndim: 3
+  grid_size: 96
+  num_patches: 864   # gd*gh*gw = 6*12*12
+  normalize: true
+  channels:
+    u: 0
+    k: 0
+  splits:
+    train: 32
+    pretrain: 32
+    finetune: 16
+    test: 8
+  ccsnet:
+    split: test
+    layout: ctxy
+    resize_to: [96, 96]    # crop W from 200 -> 96 to fit gh=gw
+
+model:
+  latent_dim: 192
+  num_predictors: 2
+  encoder:
+    type: fourier_3d
+    embed_dim: 192
+    image_size: [24, 96, 96]    # (T, H, W)
+    patch_size: [4, 8, 8]       # token grid = (6, 12, 12) = 864
+    depth: 6
+    heads: 8
+    mlp_ratio: 4.0
+    dropout: 0.1
+    in_channels: 1
+    fourier:
+      hidden_channels: 24
+      n_layers: 3
+      modes: [4, 8, 8]
+      use_attention: true
+      n_attention_layers: 2
+
+  predictor:
+    stages:
+      - name: pressure_step
+        depth: 2
+        heads: 4
+        hidden_dim: 192
+
+decoder:
+  embed_dim: 192
+  out_channels: 1
+  image_size: [24, 96, 96]
+  patch_size: [4, 8, 8]
+  per_stage: true
+
+physics:
+  type: darcy_3d
+  mu_w: 1.0
+  mu_n: 5.0
+  dx: 1.0
+  dy: 1.0
+  dz: 1.0
+
+training:
+  epochs: 2
+  batch_size: 2
+  optim:
+    lr: 1.5e-4
+    weight_decay: 5e-2
+    betas: [0.9, 0.95]
+  gradient:
+    clip_norm: 1.0
+
+loss:
+  prediction:
+    weight: 1.0
+    normalize: true
+  physics:
+    enabled: false
+    weight: 0.1
+    ramp_steps: 50
+  regularization:
+    weight: 1.0
+    variance:
+      weight: 0.05
+      gamma: 1.0
+    covariance:
+      weight: 0.01
+
+ema:
+  enabled: true
+  schedule:
+    tau_start: 0.99
+    tau_end: 0.999
+    warmup_fraction: 0.1
+
+masking:
+  context_ratio: 0.65
+
+pretraining:
+  enabled: true
+  epochs: 2
+  batch_size: 2
+  n_unlabeled: 32
+  jepa:
+    normalize_embeddings: true
+    stop_gradient_target: true
+  masking:
+    context_ratio: 0.65
+    min_block_size: 1
+    max_block_size: 3
+  physics:
+    enabled: false
+  vicreg:
+    variance_weight: 0.05
+    covariance_weight: 0.01
+  optim:
+    lr: 1.5e-4
+    weight_decay: 5e-2
+    betas: [0.9, 0.95]
+  ema:
+    tau_start: 0.99
+    tau_end: 0.999
+    warmup_fraction: 0.1
+  checkpoint:
+    save_interval: 2
+    save_best: true
+
+logging:
+  base_dir: ./outputs_ccsnet_3d_smoke
+  log_interval: 5
+  save_interval: 2

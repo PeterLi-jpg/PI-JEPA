@@ -213,3 +213,11 @@ __marimo__/
 /full_benchmarks/
 /publication/
 /publication_v2/
+# Local data and experiment outputs (large binary, not source)
+data/
+outputs/
+outputs_*/
+*.pt
+*.hdf5
+*.h5
+*.part

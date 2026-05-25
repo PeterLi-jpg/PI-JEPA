@@ -10,7 +10,7 @@ from .schedules import (
     build_physics_weight_schedule,
     build_k3_physics_weights,
 )
-from .masking import SpatialBlockMasker, build_spatial_block_masker
+from .masking import SpatialBlockMasker, SpatialBlockMasker3D, build_spatial_block_masker
 from .pretrainer import (
     SelfSupervisedPretrainer,
     VICRegLoss,
@@ -35,6 +35,7 @@ __all__ = [
     "build_physics_weight_schedule",
     "build_k3_physics_weights",
     "SpatialBlockMasker",
+    "SpatialBlockMasker3D",
     "build_spatial_block_masker",
     "SelfSupervisedPretrainer",
     "VICRegLoss",

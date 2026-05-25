@@ -10,6 +10,45 @@ Correspondence: b.yee@ycrg-labs.org
 
 ---
 
+## This fork (follow-up paper in progress)
+
+This fork extends PI-JEPA with the methodological + practical pieces the
+original paper claimed but didn't deliver, plus genuinely novel additions.
+See `PAPER_OUTLINE.md` for the working paper outline and `DATASHEET.md` for
+the synthetic-data datasheet.
+
+**Entry points (new):**
+
+| Goal | Script |
+|---|---|
+| Pretrain PI-JEPA (3D, rectangular grid, optional per-sub-op physics, multi-fidelity, spectral) | `python scripts/pretrain.py --config configs/...` |
+| Fine-tune a pretrained checkpoint on labeled (x,y) | `python scripts/finetune_pijepa.py --pretrain-checkpoint ...` |
+| Train a baseline (FNO3D / U-FNO3D / PINO3D) supervised | `python scripts/train_baseline.py --baseline {fno3d,ufno3d,pino3d} ...` |
+| Multi-seed orchestrator with bootstrap CIs | `python scripts/run_multiseed.py --pretrain-config ... --n-seeds 5` |
+| **Focused paper driver (Option B scope, ~$285 on A100)** | `./scripts/run_focused_paper.sh outputs_focused/v1 darcy_3d_synthetic` |
+| Main comparison (extended grid) | `python scripts/run_main_comparison.py --output outputs_main/v1 --n-labeled 16 32 64 --n-seeds 3` |
+| Ablation table (extended) | `python scripts/run_ablations.py --base-config configs/darcy_3d_mf_smoke.yaml --n-seeds 3` |
+| Cross-domain transfer (appendix) | `python scripts/run_cross_domain.py --datasets darcy_3d_synthetic --n-seeds 3` |
+| Paper figures (qualitative / ablation bar / data-eff curve) | `python scripts/make_paper_figures.py {qualitative,ablation,data_eff} ...` |
+| Full paper experiment driver (wider scope) | `./scripts/run_paper_experiments.sh outputs_paper_v1` |
+| Synthetic 3D Darcy generator (Tier 2) | `python scripts/generate_darcy_data_3d.py --n-train 64 --resolution 32` |
+| Multi-fidelity Tier 1 (coarse-grid) generator | `python scripts/generate_darcy_tier1.py --n-samples 64 --coarse-resolution 16` |
+
+**New architecture features:**
+- `model.encoder.type: fourier_3d` enables 3D Fourier encoder (rectangular grids via `image_size: [T, H, W]` lists)
+- `decoder.per_stage: true` builds K independent decoders (one per predictor sub-operator)
+- `model.predictor.splitting: {lie_trotter, strang, monolithic}` selects the latent operator-splitting scheme
+- `physics.residual_type: {fd, spectral}` selects finite-difference vs FFT-based physics residuals
+- `data.dataset: darcy_3d_mf` enables the multi-fidelity (Tier 0 + Tier 1) pretraining curriculum
+
+**Reproducibility:**
+- `requirements.lock` — full pip freeze of the venv
+- `DATASHEET.md` — datasheet for synthetic data
+- `PI-JEPA/utils/compute_disclosure.py` — `ComputeRecorder` context manager writes per-run hardware + wall-clock + carbon JSON
+- All evaluation reports use bootstrap 95% CI over ≥5 seeds (NeurIPS Q7)
+
+---
+
 ### Quick Start
 
 ```bash

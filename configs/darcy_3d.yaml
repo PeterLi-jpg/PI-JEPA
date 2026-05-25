@@ -1,0 +1,204 @@
+# =============================================================================
+# PI-JEPA 3D Darcy Smoke-Test Configuration
+# Small (32^3) synthetic dataset; tuned to fit on a single MPS/CUDA device.
+# Pretrain 5 epochs is what we use for a "does it run" smoke test;
+# bump to 500 for real runs.
+# =============================================================================
+
+problem:
+  type: steady_state
+
+experiment:
+  name: pi_jepa_darcy_3d_smoke
+  seed: 42
+  device: null  # auto-detect cuda > mps > cpu
+  precision: fp32
+  deterministic: false
+
+data:
+  dataset: darcy_3d
+  path: data/darcy_3d
+  grid_size: 32          # cubic side length (D = H = W = 32)
+  ndim: 3
+  sequence_length: 1
+  stride: 1
+  normalize: true
+  num_patches: 512       # (32/4)^3 = 8^3 = 512
+  channels:
+    u: 0
+    k: 1
+  splits:
+    train: 64
+    pretrain: 64
+    finetune: 32
+    test: 8
+
+model:
+  latent_dim: 256
+  num_predictors: 2  # K=2 for two-phase Darcy; can stay 1 for single-phase
+  encoder:
+    type: fourier_3d
+    embed_dim: 256
+    patch_size: 4
+    image_size: 32
+    depth: 6
+    heads: 8
+    mlp_ratio: 4.0
+    dropout: 0.1
+    attention_dropout: 0.1
+    drop_path: 0.1
+    residual_scale: 1.0
+    in_channels: 1
+    fourier:
+      hidden_channels: 32
+      n_layers: 3
+      modes: [8, 8, 8]
+      use_attention: true
+      n_attention_layers: 2
+
+  predictor:
+    stages:
+      - name: pressure_step
+        depth: 2
+        heads: 4
+        hidden_dim: 256
+    drop_path: 0.1
+    sequential: true
+    skip_connections: true
+    channel_mixing: false
+    n_species: 1
+
+decoder:
+  embed_dim: 256
+  out_channels: 1
+  image_size: 32
+  patch_size: 4
+
+physics:
+  type: darcy_3d
+  mu_w: 1.0
+  mu_n: 5.0
+  collocation_size: 16   # used by 2D code; ignored by 3D residual
+  dx: 1.0
+  dy: 1.0
+  dz: 1.0
+  dt: 1.0
+  brooks_corey:
+    S_wr: 0.0
+    S_nr: 0.0
+    lambda: 2.0
+
+training:
+  epochs: 5
+  batch_size: 4
+  optim:
+    lr: 1.5e-4
+    weight_decay: 5e-2
+    betas: [0.9, 0.95]
+  gradient:
+    clip_norm: 1.0
+  rollout_training:
+    enabled: false
+
+loss:
+  prediction:
+    weight: 1.0
+    normalize: true
+  physics:
+    enabled: false        # off for smoke test; flip on once 3D residual is wired
+    weight: 0.1
+    ramp_steps: 50
+  regularization:
+    weight: 1.0
+    variance:
+      weight: 0.05
+      gamma: 1.0
+    covariance:
+      weight: 0.01
+
+ema:
+  enabled: true
+  schedule:
+    tau_start: 0.99
+    tau_end: 0.999
+    warmup_fraction: 0.1
+
+masking:
+  context_ratio: 0.65
+
+pretraining:
+  enabled: true
+  epochs: 5
+  batch_size: 4
+  n_unlabeled: 64
+  jepa:
+    normalize_embeddings: true
+    stop_gradient_target: true
+  masking:
+    context_ratio: 0.65
+    min_block_size: 1
+    max_block_size: 4
+  physics:
+    enabled: false        # off for smoke test
+    weight: 0.1
+    ramp_steps: 50
+  vicreg:
+    variance_weight: 0.05
+    covariance_weight: 0.01
+  optim:
+    lr: 1.5e-4
+    weight_decay: 5e-2
+    betas: [0.9, 0.95]
+  ema:
+    tau_start: 0.99
+    tau_end: 0.999
+    warmup_fraction: 0.1
+  checkpoint:
+    save_interval: 5
+    save_best: true
+
+finetuning:
+  enabled: true
+  epochs: 5
+  batch_size: 4
+  n_labeled: 32
+  n_labeled_sweep: [16, 32]
+  freeze_encoder: false
+  prediction_head:
+    hidden_dim: 256
+    output_channels: 1
+  optim:
+    lr: 5e-4
+    weight_decay: 1e-4
+  full_finetune:
+    enabled: true
+    encoder_lr_multiplier: 0.2
+  checkpoint:
+    save_interval: 5
+    save_best: true
+
+rollout:
+  horizons: [1]
+  noise:
+    enabled: false
+    sigma_start: 1e-2
+    sigma_end: 1e-4
+    schedule: linear
+
+evaluation:
+  metrics:
+    - relative_l2
+  data_efficiency:
+    enabled: true
+    n_labeled_sweep: [16, 32]
+    baselines: []
+    test_set_size: 8
+    output_file: benchmark_comparison_3d.json
+
+visualization:
+  enabled: false
+
+logging:
+  base_dir: ./outputs_3d
+  log_interval: 10
+  save_interval: 5

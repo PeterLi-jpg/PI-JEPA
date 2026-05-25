@@ -1,0 +1,153 @@
+# =============================================================================
+# FNO4CO2 lite smoke test (3D time-preserving, U-FNO native treatment).
+# Uses the 10-sample lite_dataset to develop without waiting for the full
+# 50-100 GB train files. Identical config patterns to ccsnet_3d_smoke.yaml
+# except: 12 input channels (vs CCSNet's 1) and slightly different spatial.
+# =============================================================================
+
+problem:
+  type: steady_state
+
+experiment:
+  name: pi_jepa_fno4co2_3d_smoke
+  seed: 42
+  device: null
+  precision: fp32
+  deterministic: false
+
+data:
+  dataset: fno4co2
+  path: data/fno4co2/dataset/lite_dataset
+  ndim: 3
+  grid_size: 96
+  num_patches: 864
+  normalize: true
+  channels:
+    u: 0
+    k: 0
+  splits:
+    train: 8
+    pretrain: 8
+    finetune: 4
+    test: 2
+  fno4co2:
+    variant: dP
+    split: test
+    layout: ctxy
+    resize_to: [96, 96]
+    # Override the dataset filename pattern via variant + split, but the
+    # actual lite files are dP_test_a_lite10.pt. We just point at root and
+    # the loader builds dP_test_a.pt as the path; symlink would be cleanest.
+    # For now, pre-test with a tiny aux script.
+
+model:
+  latent_dim: 192
+  num_predictors: 2
+  encoder:
+    type: fourier_3d
+    embed_dim: 192
+    image_size: [24, 96, 96]
+    patch_size: [4, 8, 8]
+    depth: 6
+    heads: 8
+    mlp_ratio: 4.0
+    dropout: 0.1
+    in_channels: 12      # 12 channels in FNO4CO2 dP_*_a
+    fourier:
+      hidden_channels: 24
+      n_layers: 3
+      modes: [4, 8, 8]
+      use_attention: true
+      n_attention_layers: 2
+
+  predictor:
+    stages:
+      - name: pressure_step
+        depth: 2
+        heads: 4
+        hidden_dim: 192
+
+decoder:
+  embed_dim: 192
+  out_channels: 1
+  image_size: [24, 96, 96]
+  patch_size: [4, 8, 8]
+  per_stage: true
+
+physics:
+  type: darcy_3d
+  mu_w: 1.0
+  mu_n: 5.0
+  dx: 1.0
+  dy: 1.0
+  dz: 1.0
+
+training:
+  epochs: 2
+  batch_size: 2
+  optim:
+    lr: 1.5e-4
+    weight_decay: 5e-2
+    betas: [0.9, 0.95]
+  gradient:
+    clip_norm: 1.0
+
+loss:
+  prediction:
+    weight: 1.0
+    normalize: true
+  physics:
+    enabled: false
+    weight: 0.1
+    ramp_steps: 5
+  regularization:
+    weight: 1.0
+    variance:
+      weight: 0.05
+      gamma: 1.0
+    covariance:
+      weight: 0.01
+
+ema:
+  enabled: true
+  schedule:
+    tau_start: 0.99
+    tau_end: 0.999
+    warmup_fraction: 0.1
+
+masking:
+  context_ratio: 0.65
+
+pretraining:
+  enabled: true
+  epochs: 2
+  batch_size: 2
+  n_unlabeled: 8        # lite has 10 — leave 2 for sanity
+  jepa:
+    normalize_embeddings: true
+    stop_gradient_target: true
+  masking:
+    context_ratio: 0.65
+    min_block_size: 1
+    max_block_size: 3
+  physics:
+    enabled: false
+  vicreg:
+    variance_weight: 0.05
+    covariance_weight: 0.01
+  optim:
+    lr: 1.5e-4
+    weight_decay: 5e-2
+    betas: [0.9, 0.95]
+  ema:
+    tau_start: 0.99
+    tau_end: 0.999
+    warmup_fraction: 0.1
+  checkpoint:
+    save_interval: 2
+    save_best: true
+
+logging:
+  base_dir: ./outputs_fno4co2_3d_smoke
+  log_interval: 5
+  save_interval: 2

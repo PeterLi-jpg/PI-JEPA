@@ -29,7 +29,7 @@ experiment:
 # Data Configuration
 # -----------------------------------------------------------------------------
 data:
-  dataset: ufno_co2  # ufno_co2, pdebench_adr, spe10, navier_stokes
+  dataset: darcy_flow  # Default for darcy.yaml; override for other domains
   path: ""  # Empty string to use neuralop auto-download, or specify local path
   grid_size: 64  # 64x64 resolution for proper masking (8x8 grid of patches)
   sequence_length: 2
@@ -67,7 +67,7 @@ model:
     attention_dropout: 0.1
     drop_path: 0.1
     residual_scale: 1.0
-    in_channels: 2  # 1 for pretraining (coefficient only), 2 for legacy (solution + coefficient)
+    in_channels: 1  # Pretraining uses coefficient field only; live path (scripts/pretrain.py) overrides to 1 via build_encoder(config, in_channels=1)
     
     # Fourier encoder specific settings
     fourier:
@@ -298,16 +298,6 @@ finetuning:
     save_best: true  # Save best model based on validation loss
 
 # -----------------------------------------------------------------------------
-# Legacy Fine-Tuning Configuration (Deprecated)
-# -----------------------------------------------------------------------------
-# Kept for backward compatibility. Use 'finetuning' section above instead.
-finetune:
-  epochs: 100  # Paper: 100 epochs fine-tuning
-  lr: 1.5e-4  # Paper: same learning rate
-  n_labeled: [10, 25, 50, 100, 250, 500]  # Data efficiency sweep
-  freeze_encoder: true
-
-# -----------------------------------------------------------------------------
 # Rollout Configuration
 # -----------------------------------------------------------------------------
 rollout:
@@ -333,7 +323,7 @@ evaluation:
   data_efficiency:
     enabled: true
     n_labeled_sweep: [10, 25, 50, 100, 250, 500]  # Labeled sample counts to evaluate
-    baselines: [fno, geo_fno, deeponet]  # Baseline models to compare against
+    baselines: [fno, pino, deeponet]  # Match paper baselines (FNO/PINO/DeepONet)
     test_set_size: 200  # Number of test samples
     output_file: benchmark_comparison.json  # Output file for results
 

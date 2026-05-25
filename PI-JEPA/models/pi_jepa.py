@@ -27,46 +27,113 @@ class PIJEPA(nn.Module):
         nn.init.normal_(self.mask_token, std=0.02)
 
     def mask_input(self, x, target_indices):
-        B, C, H, W = x.shape
-        
-        # Get patch_size from encoder if available, otherwise use self.patch_size
-        if hasattr(self.encoder, 'patch_size'):
-            patch_size = self.encoder.patch_size
+        """Zero out target-patch regions of x.
+
+        Supports both 2D (B, C, H, W) and 3D (B, C, D, H, W) inputs.
+        target_indices is (B, N_t) of patch indices in row-major (or
+        depth-major-row-major for 3D) order.
+        """
+        if x.dim() == 4:
+            return self._mask_input_2d(x, target_indices)
+        elif x.dim() == 5:
+            return self._mask_input_3d(x, target_indices)
         else:
-            patch_size = self.patch_size
-        
+            raise ValueError(
+                f"mask_input expects 4D (B,C,H,W) or 5D (B,C,D,H,W); got shape {tuple(x.shape)}"
+            )
+
+    def _get_patch_size(self):
+        if hasattr(self.encoder, 'patch_size'):
+            return self.encoder.patch_size
+        return self.patch_size
+
+    def _mask_input_2d(self, x, target_indices):
+        B, C, H, W = x.shape
+        patch_size = self._get_patch_size()
+
         grid_size = H // patch_size
         num_patches = grid_size * grid_size
-        
-        # Clamp target_indices to valid range to prevent out-of-bounds errors
-        # This handles cases where masker grid_size doesn't match encoder grid_size
-        target_indices_clamped = target_indices.clamp(0, num_patches - 1)
+
+        max_idx = target_indices.max().item() if target_indices.numel() > 0 else -1
+        if max_idx >= num_patches:
+            raise ValueError(
+                f"target_indices max={max_idx} exceeds encoder's num_patches={num_patches} "
+                f"(image_size={H}x{W}, patch_size={patch_size}). "
+                f"Masker grid_size likely doesn't match encoder grid_size."
+            )
+        target_indices_clamped = target_indices.clamp(min=0)
 
         mask = torch.ones(B, num_patches, device=x.device)
-
         mask = mask.scatter(
             1,
             target_indices_clamped,
-            torch.zeros_like(target_indices_clamped, dtype=mask.dtype)
+            torch.zeros_like(target_indices_clamped, dtype=mask.dtype),
         )
 
         mask = mask.view(B, grid_size, grid_size)
         mask = mask.repeat_interleave(patch_size, dim=1)
         mask = mask.repeat_interleave(patch_size, dim=2)
         mask = mask.unsqueeze(1)
-
         return x * mask
-    
-    def get_num_patches(self, image_size: int) -> int:
-        """Get the number of patches for a given image size."""
-        if hasattr(self.encoder, 'patch_size'):
-            patch_size = self.encoder.patch_size
-        else:
-            patch_size = self.patch_size
-        grid_size = image_size // patch_size
-        return grid_size * grid_size
 
-    def forward(self, x, context_indices, target_indices):
+    def _mask_input_3d(self, x, target_indices):
+        B, C, D, H, W = x.shape
+
+        # Prefer the encoder's authoritative (grid_dhw, patch_dhw) — needed
+        # for rectangular grids. Fall back to legacy cubic computation.
+        enc = self.encoder
+        if hasattr(enc, "grid_size_dhw") and hasattr(enc, "patch_size_dhw"):
+            gd, gh, gw = enc.grid_size_dhw
+            pd, ph, pw = enc.patch_size_dhw
+        else:
+            patch = self._get_patch_size()
+            gd = D // patch
+            gh = H // patch
+            gw = W // patch
+            pd = ph = pw = patch
+
+        num_patches = gd * gh * gw
+
+        max_idx = target_indices.max().item() if target_indices.numel() > 0 else -1
+        if max_idx >= num_patches:
+            raise ValueError(
+                f"target_indices max={max_idx} exceeds encoder's num_patches={num_patches} "
+                f"(volume={D}x{H}x{W}, patch=({pd},{ph},{pw}), grid=({gd},{gh},{gw})). "
+                f"Masker grid_size likely doesn't match encoder grid_size."
+            )
+        target_indices_clamped = target_indices.clamp(min=0)
+
+        mask = torch.ones(B, num_patches, device=x.device)
+        mask = mask.scatter(
+            1,
+            target_indices_clamped,
+            torch.zeros_like(target_indices_clamped, dtype=mask.dtype),
+        )
+
+        mask = mask.view(B, gd, gh, gw)
+        mask = mask.repeat_interleave(pd, dim=1)
+        mask = mask.repeat_interleave(ph, dim=2)
+        mask = mask.repeat_interleave(pw, dim=3)
+        mask = mask.unsqueeze(1)  # (B, 1, D, H, W)
+        return x * mask
+
+    def get_num_patches(self, image_size: int, ndim: int = 2) -> int:
+        """Get the number of patches for a given image size and dimensionality.
+
+        Args:
+            image_size: side length of the input field
+            ndim: 2 for (H, W) inputs, 3 for (D, H, W) inputs
+        """
+        patch_size = self._get_patch_size()
+        grid_size = image_size // patch_size
+        return grid_size ** ndim
+
+    def forward(self, x, context_indices, target_indices, return_stage_outputs: bool = False):
+        """Original 2D-compatible forward (kept for backward compat).
+
+        Uses the broken additive-ensemble chain. Prefer forward_operator_split
+        for true Lie-Trotter operator splitting across multiple predictors.
+        """
         B = x.shape[0]
 
         x_masked = self.mask_input(x, target_indices)
@@ -124,6 +191,90 @@ class PIJEPA(nn.Module):
         z_target = F.normalize(z_target, dim=-1)
 
         return z_pred, z_target
+
+    def forward_operator_split(self, x, context_indices, target_indices, splitting: str = "lie_trotter"):
+        """True operator-splitting forward in latent space.
+
+        splitting:
+          - "lie_trotter" (default): 1st-order Lie-Trotter chain
+                ẑ^(k) = g_{φ_k}(ẑ^(k-1), z_context)  for k = 1..K
+            One pass through each predictor in order.
+
+          - "strang": 2nd-order Strang splitting (for K=2 only)
+                ẑ^(0.5) = g_{φ_1}^{1/2}(ẑ^(0), z_context)
+                ẑ^(1.5) = g_{φ_2}(ẑ^(0.5), z_context)
+                ẑ^(2)   = g_{φ_1}^{1/2}(ẑ^(1.5), z_context)
+            We approximate the "half step" by sharing g_{φ_1} across both
+            half passes (the predictor itself is fixed; only its application
+            count changes). Higher-order accuracy in the same training budget.
+
+          - "monolithic": all predictors collapsed into a single composed
+            pass (acts as an ablation against the per-sub-operator structure).
+
+        Returns:
+            z_pred, z_target, stage_outputs, z_full
+        """
+        B = x.shape[0]
+
+        x_masked = self.mask_input(x, target_indices)
+
+        with torch.no_grad():
+            z_target_full = self.target_encoder(x)
+
+        z_full = self.encoder(x_masked)
+
+        # Gather context once (constant input to every predictor in the chain)
+        D = self.embed_dim
+        z_context = torch.gather(
+            z_full,
+            1,
+            context_indices.unsqueeze(-1).expand(-1, -1, D),
+        )
+
+        # Initialize chain at target positions from this model's mask_token
+        N_t = target_indices.shape[1]
+        z_t = self.mask_token.expand(B, N_t, D).contiguous()
+
+        stage_outputs = []
+        K = len(self.predictors)
+        if splitting == "strang" and K == 2:
+            # Strang: g_φ1^{1/2} → g_φ2 → g_φ1^{1/2}
+            # Implemented as 3 passes using 2 distinct predictor params.
+            z_t = self.predictors[0].forward_chained(z_t, z_context)
+            stage_outputs.append(z_t)  # ẑ^(0.5) — "half" first pass
+            z_t = self.predictors[1].forward_chained(z_t, z_context)
+            stage_outputs.append(z_t)  # ẑ^(1.5) — middle full pass
+            z_t = self.predictors[0].forward_chained(z_t, z_context)
+            stage_outputs.append(z_t)  # ẑ^(2) — closing half pass
+        elif splitting == "monolithic":
+            # Compose all predictors into a single pass each (no chain).
+            # All predictors operate on the SAME input (mask token), outputs
+            # are averaged. This mirrors the original PI-JEPA paper's
+            # broken behavior — useful as the "no operator splitting" ablation.
+            outputs = []
+            for predictor in self.predictors:
+                outputs.append(predictor.forward_chained(z_t, z_context))
+            z_t = torch.stack(outputs, dim=0).mean(dim=0)
+            stage_outputs.append(z_t)
+        else:
+            # Default Lie-Trotter (1st order). Falls back here for any K.
+            for k, predictor in enumerate(self.predictors):
+                z_t = predictor.forward_chained(z_t, z_context)
+                stage_outputs.append(z_t)
+
+        z_pred = z_t  # final stage output
+
+        z_target = torch.gather(
+            z_target_full,
+            1,
+            target_indices.unsqueeze(-1).expand(-1, -1, D),
+        )
+
+        # Match the BYOL/I-JEPA stability convention (LayerNorm + L2 normalize)
+        z_pred = F.normalize(F.layer_norm(z_pred, (D,)), dim=-1)
+        z_target = F.normalize(F.layer_norm(z_target, (D,)), dim=-1)
+
+        return z_pred, z_target.detach(), stage_outputs, z_full
 
     def encode(self, x):
         return self.encoder(x)
