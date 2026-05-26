@@ -528,6 +528,145 @@ def pretrain_on_domain(domain, config, device, output_dir, n_epochs=None,
     return load_encoder(best_ckpt, cfg, device)
 
 
+# Map dataset names to their unlabeled-loader builders. Used by both
+# pretrain_on_domain (above) and pretrain_on_combined_pool (below).
+_UNLABELED_LOADER_BUILDERS = {
+    "darcy": _build_unlabeled_loader_darcy,
+    "twophase": _build_unlabeled_loader_twophase,
+    "adr": _build_unlabeled_loader_adr,
+    "ccsnet": _build_unlabeled_loader_ccsnet,
+    "fno4co2": _build_unlabeled_loader_fno4co2,
+    "pdebench_adr": _build_unlabeled_loader_pdebench_adr,
+}
+
+
+def parse_combined_pool_spec(spec_str: str):
+    """Parse the --combined-pool CLI argument.
+
+    Format: "name1[:weight1],name2[:weight2],..." e.g.
+        "ccsnet,fno4co2"            -> equal weights
+        "ccsnet:0.6,fno4co2:0.3,darcy:0.1"
+
+    Returns: list of (name, weight) tuples. Unspecified weights default
+    to 1.0; final weights are NOT normalized here (MultiFidelityPretrainer
+    normalizes internally).
+    """
+    out = []
+    for item in spec_str.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" in item:
+            name, w = item.split(":", 1)
+            out.append((name.strip(), float(w)))
+        else:
+            out.append((item, 1.0))
+    if not out:
+        raise ValueError(f"Empty --combined-pool spec: {spec_str!r}")
+    return out
+
+
+def pretrain_on_combined_pool(
+    pool_spec, config, device, output_dir,
+    target_shape=(32, 64, 64), n_epochs=None, samples_per_epoch=1024,
+    batch_size=8,
+):
+    """Pretrain a PI-JEPA encoder on a tier-weighted combined pool of unlabeled
+    parameter fields drawn from MULTIPLE datasets.
+
+    Uses Brandon's IrregularGridProcessor (NaN sanitization) and
+    MultiFidelityPretrainer (tier sampling), wired together via
+    PI-JEPA/data/combined_pool.py.
+
+    Args:
+        pool_spec: list of (dataset_name, weight) tuples from
+            parse_combined_pool_spec().
+        config: full config dict (passed to the pretrainer + encoder builder).
+        device: torch device.
+        output_dir: where the checkpoint dir lives.
+        target_shape: (D, H, W) every sample is trilinear-resized to.
+            Default (32, 64, 64) is a reasonable common ground for the 3D
+            datasets we support.
+        n_epochs: defaults to PRETRAIN_EPOCHS from this module.
+        samples_per_epoch: how many samples one combined-pool epoch draws.
+            Pick something comparable to a single-dataset epoch.
+        batch_size: DataLoader batch size for the combined pool.
+
+    Returns:
+        A loaded encoder (same return type as pretrain_on_domain).
+    """
+    # Late imports keep the script's top-level startup cheap when this
+    # entry point isn't used.
+    from training.pretrainer import build_model_for_pretraining, SelfSupervisedPretrainer
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "..", "PI-JEPA"))
+    from data.combined_pool import build_combined_pool_loader
+
+    if n_epochs is None:
+        n_epochs = PRETRAIN_EPOCHS
+
+    cfg = copy.deepcopy(config)
+
+    # Stable checkpoint dir based on pool composition so we can resume / cache.
+    tag = "_".join(f"{n}{w:g}" for n, w in pool_spec)
+    ckpt_dir = os.path.join(output_dir, f"pretrain_pool_{tag}")
+    best_ckpt = os.path.join(ckpt_dir, "checkpoint_best.pt")
+    if os.path.exists(best_ckpt):
+        print(f"  Found existing combined-pool checkpoint at {ckpt_dir}")
+        return load_encoder(best_ckpt, cfg, device)
+
+    # Ensure all required source datasets are present on disk before we
+    # try to materialize them via their per-domain ensure_* hooks.
+    ensure_hooks = {
+        "darcy": ensure_darcy_data,
+        "twophase": ensure_twophase_data,
+        "adr": ensure_adr_data,
+        "ccsnet": lambda: ensure_ccsnet_data(target_var="SG"),
+        "fno4co2": ensure_fno4co2_data,
+        "pdebench_adr": ensure_pdebench_adr_data,
+    }
+    for name, _ in pool_spec:
+        hook = ensure_hooks.get(name)
+        if hook is None:
+            raise KeyError(
+                f"--combined-pool dataset '{name}' has no ensure_* hook. "
+                f"Supported: {sorted(ensure_hooks)}"
+            )
+        hook()
+
+    # Build the tier_specs CombinedPoolDataset wants. Each build_fn returns
+    # the underlying torch Dataset (we strip Brandon's DataLoader wrapper).
+    def _make_build_fn(name):
+        builder = _UNLABELED_LOADER_BUILDERS[name]
+        return lambda: builder().dataset
+
+    tier_specs = [
+        {"name": name, "weight": w, "build_fn": _make_build_fn(name)}
+        for name, w in pool_spec
+    ]
+
+    print(f"  Pretraining on COMBINED POOL ({n_epochs} epochs)")
+    print(f"    tiers: {[(s['name'], s['weight']) for s in tier_specs]}")
+    print(f"    target_shape: {target_shape}, samples/epoch: {samples_per_epoch}")
+
+    data_loader = build_combined_pool_loader(
+        tier_specs=tier_specs,
+        target_shape=tuple(target_shape),
+        batch_size=batch_size,
+        samples_per_epoch=samples_per_epoch,
+        progressive=False,
+        num_workers=0,
+    )
+
+    model, decoder = build_model_for_pretraining(cfg, device)
+    pretrainer = SelfSupervisedPretrainer(
+        model=model, decoder=decoder, config=cfg, device=device
+    )
+    pretrainer.pretrain(data_loader=data_loader, n_epochs=n_epochs,
+                        checkpoint_dir=ckpt_dir)
+    return load_encoder(best_ckpt, cfg, device)
+
+
 def _deep_update(base, overrides):
     """Recursively update nested dict."""
     for k, v in overrides.items():
@@ -1229,6 +1368,18 @@ def main():
     p.add_argument("--n-seeds", type=int, default=DEFAULT_N_SEEDS)
     p.add_argument("--domain-matched", action="store_true",
                    help="Pretrain separate encoders per benchmark domain")
+    p.add_argument("--combined-pool", default=None,
+                   help="Pretrain ONE encoder on a tier-weighted combined "
+                   "pool of unlabeled inputs from multiple datasets. "
+                   "Format: 'name1[:weight],name2[:weight],...' e.g. "
+                   "'ccsnet:0.6,fno4co2:0.3,darcy:0.1'. Mutually exclusive "
+                   "with --domain-matched.")
+    p.add_argument("--combined-pool-shape", nargs=3, type=int,
+                   default=[32, 64, 64], metavar=("D", "H", "W"),
+                   help="Common (D H W) every combined-pool sample is "
+                   "resized to. Default: 32 64 64.")
+    p.add_argument("--combined-pool-samples-per-epoch", type=int, default=1024,
+                   help="Samples drawn per combined-pool epoch. Default 1024.")
     p.add_argument("--ablation", action="store_true",
                    help="Run ablation study after benchmarks")
     p.add_argument("--ablation-benchmark", default="darcy",
@@ -1274,7 +1425,26 @@ def main():
     # Always pretrain a Darcy encoder (needed as cross-domain baseline)
     darcy_encoder = None
 
-    if args.domain_matched:
+    if args.combined_pool and args.domain_matched:
+        raise SystemExit(
+            "--combined-pool and --domain-matched are mutually exclusive: "
+            "the first builds ONE shared encoder, the second builds N."
+        )
+
+    if args.combined_pool:
+        pool_spec = parse_combined_pool_spec(args.combined_pool)
+        print(f"Pretraining ONE encoder on combined pool: {pool_spec}")
+        shared_enc = pretrain_on_combined_pool(
+            pool_spec, config, device, args.output,
+            target_shape=tuple(args.combined_pool_shape),
+            samples_per_epoch=args.combined_pool_samples_per_epoch,
+        )
+        encoders = {b: shared_enc for b in args.benchmarks}
+        # darcy_encoder is used downstream for cross-domain comparisons; in
+        # combined-pool mode the "cross-domain" baseline IS the shared
+        # encoder, so we alias it.
+        darcy_encoder = shared_enc
+    elif args.domain_matched:
         encoders = {}
         for bname in args.benchmarks:
             encoders[bname] = pretrain_on_domain(
