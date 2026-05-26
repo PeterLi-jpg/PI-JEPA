@@ -8,6 +8,45 @@ this datasheet does NOT replace those.
 
 ---
 
+## Pretraining data protocol (explicit, per reviewer Nwi3)
+
+Reviewer Nwi3's central concern with the original submission was that the
+"label-free pretraining" claim appeared inconsistent with the method's
+description, which mentioned tokenizing solution fields and spatiotemporal
+targets at t+Δt. To remove all ambiguity in this resubmission, we state the
+protocol explicitly:
+
+**PI-JEPA self-supervised pretraining uses PARAMETER FIELDS ONLY.** The
+unlabeled corpus consists exclusively of input fields that can be generated
+or downloaded WITHOUT running a PDE solver:
+
+- **Synthetic Darcy 3D** — permeability fields `K(x)` sampled via log-Gaussian
+  random fields. No PDE solve required to generate the unlabeled corpus.
+- **CCSNet** — the `test_x.hdf5` permeability and porosity fields shipped by
+  Wen et al. 2021, used as raw geological inputs. We do NOT use any of
+  CCSNet's `test_y_*.hdf5` simulation outputs during pretraining.
+- **FNO4CO2** — the input parameter channels (permeability, porosity,
+  injection-well masks) from the FNO4CO2 corpus. Solution channels are
+  excluded from the pretrain pool.
+
+The masked-latent-prediction (JEPA) loss operates on patches of these
+parameter fields: visible patches predict masked patches in the latent
+space of an EMA target encoder. No PDE solver is invoked at any point
+during pretraining; no time-derivative residuals are computed against
+true solution states; no `t → t+Δt` rollouts are used as targets.
+
+Fine-tuning is supervised and DOES use the corresponding labeled
+(input → output) PDE solution pairs. The cost asymmetry the paper
+claims is: parameter fields are free, labeled simulation pairs are
+expensive, and PI-JEPA exploits the free corpus during pretrain so the
+expensive corpus is only needed for fine-tuning.
+
+`PI-JEPA/data/combined_pool.py` enforces this discipline at the loader
+level: tier specs only point at parameter-field datasets, never at
+simulation-output datasets.
+
+---
+
 ## Motivation
 
 **For what purpose was the dataset created?**
