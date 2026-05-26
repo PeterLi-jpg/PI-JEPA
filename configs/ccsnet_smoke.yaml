@@ -1,0 +1,147 @@
+# =============================================================================
+# PI-JEPA CCSNet smoke test.
+# Uses the existing 2D Fourier encoder. CCSNet native shape is (96, 200) —
+# we resize to 64x64 for this smoke test so the 8x8 patch grid works out
+# cleanly. Native-shape support is a separate task on the roadmap.
+# =============================================================================
+
+problem:
+  type: steady_state
+
+experiment:
+  name: pi_jepa_ccsnet_smoke
+  seed: 42
+  device: null
+  precision: fp32
+  deterministic: false
+
+data:
+  dataset: ccsnet
+  path: data/ccsnet/CCSNet_v1.0
+  ndim: 2
+  grid_size: 64
+  num_patches: 64       # (grid_size / patch_size)^2 = (64/8)^2
+  normalize: true
+  channels:
+    u: 0
+    k: 0
+  splits:
+    train: 64
+    pretrain: 64
+    finetune: 32
+    test: 16
+  ccsnet:
+    split: test       # using the test split since it's the file we've fully downloaded
+    t_index: 0
+    resize_to: [64, 64]
+
+model:
+  latent_dim: 384
+  num_predictors: 2
+  encoder:
+    type: fourier
+    embed_dim: 384
+    patch_size: 8
+    image_size: 64
+    depth: 6
+    heads: 8
+    mlp_ratio: 4.0
+    dropout: 0.1
+    in_channels: 1
+    fourier:
+      hidden_channels: 64
+      n_layers: 4
+      modes: [16, 16]
+      use_attention: true
+      n_attention_layers: 2
+
+  predictor:
+    stages:
+      - name: pressure_step
+        depth: 2
+        heads: 4
+        hidden_dim: 384
+
+decoder:
+  embed_dim: 384
+  out_channels: 1
+  image_size: 64
+  patch_size: 8
+  per_stage: true
+
+physics:
+  type: darcy
+  mu_w: 1.0
+  mu_n: 5.0
+  dx: 1.0
+  dy: 1.0
+
+training:
+  epochs: 3
+  batch_size: 8
+  optim:
+    lr: 1.5e-4
+    weight_decay: 5e-2
+    betas: [0.9, 0.95]
+  gradient:
+    clip_norm: 1.0
+
+loss:
+  prediction:
+    weight: 1.0
+    normalize: true
+  physics:
+    enabled: false
+    weight: 0.1
+    ramp_steps: 50
+  regularization:
+    weight: 1.0
+    variance:
+      weight: 0.05
+      gamma: 1.0
+    covariance:
+      weight: 0.01
+
+ema:
+  enabled: true
+  schedule:
+    tau_start: 0.99
+    tau_end: 0.999
+    warmup_fraction: 0.1
+
+masking:
+  context_ratio: 0.65
+
+pretraining:
+  enabled: true
+  epochs: 3
+  batch_size: 8
+  n_unlabeled: 64       # tiny smoke; the full file has 1600
+  jepa:
+    normalize_embeddings: true
+    stop_gradient_target: true
+  masking:
+    context_ratio: 0.65
+    min_block_size: 2
+    max_block_size: 4
+  physics:
+    enabled: false
+  vicreg:
+    variance_weight: 0.05
+    covariance_weight: 0.01
+  optim:
+    lr: 1.5e-4
+    weight_decay: 5e-2
+    betas: [0.9, 0.95]
+  ema:
+    tau_start: 0.99
+    tau_end: 0.999
+    warmup_fraction: 0.1
+  checkpoint:
+    save_interval: 3
+    save_best: true
+
+logging:
+  base_dir: ./outputs_ccsnet_smoke
+  log_interval: 5
+  save_interval: 3

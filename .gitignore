@@ -216,3 +216,8 @@ __marimo__/
 /publication_v2_fixes/
 /data/
 /.kiro/
+
+# Extra output dirs from our orchestrators / smoke tests, env, partials
+/outputs_*/
+*.part
+.venv/

@@ -1,0 +1,148 @@
+# =============================================================================
+# Multi-fidelity 3D Darcy smoke test.
+# Mixes Tier-0 (free GRF parameter fields) with Tier-1 (coarse-grid solver
+# outputs upsampled to 32^3). Tier-1 batches carry a y_coarse target that
+# the trainer adds as a small reconstruction loss alongside JEPA + VICReg.
+# =============================================================================
+
+problem:
+  type: steady_state
+
+experiment:
+  name: pi_jepa_darcy_3d_mf_smoke
+  seed: 42
+  device: null
+  precision: fp32
+  deterministic: false
+
+data:
+  dataset: darcy_3d_mf
+  ndim: 3
+  grid_size: 32
+  num_patches: 512
+  normalize: true
+  channels:
+    u: 0
+    k: 0
+  splits:
+    train: 64
+    pretrain: 64
+    finetune: 32
+    test: 8
+  multifidelity:
+    tier0_path: data/darcy_3d/darcy3d_train.pt
+    tier1_path: data/darcy_3d_tier1/darcy3d_tier1.pt
+    n_tier1: 64
+
+model:
+  latent_dim: 256
+  num_predictors: 2
+  encoder:
+    type: fourier_3d
+    embed_dim: 256
+    patch_size: 4
+    image_size: 32
+    depth: 6
+    heads: 8
+    mlp_ratio: 4.0
+    dropout: 0.1
+    in_channels: 1
+    fourier:
+      hidden_channels: 32
+      n_layers: 3
+      modes: [8, 8, 8]
+      use_attention: true
+      n_attention_layers: 2
+
+  predictor:
+    stages:
+      - name: pressure_step
+        depth: 2
+        heads: 4
+        hidden_dim: 256
+
+decoder:
+  embed_dim: 256
+  out_channels: 1
+  image_size: 32
+  patch_size: 4
+  per_stage: true
+
+physics:
+  type: darcy_3d
+  dx: 1.0
+  dy: 1.0
+  dz: 1.0
+
+training:
+  epochs: 3
+  batch_size: 4
+  optim:
+    lr: 1.5e-4
+    weight_decay: 5e-2
+    betas: [0.9, 0.95]
+  gradient:
+    clip_norm: 1.0
+
+loss:
+  prediction:
+    weight: 1.0
+    normalize: true
+  physics:
+    enabled: false
+    weight: 0.1
+    ramp_steps: 20
+  regularization:
+    weight: 1.0
+    variance:
+      weight: 0.05
+      gamma: 1.0
+    covariance:
+      weight: 0.01
+
+ema:
+  enabled: true
+  schedule:
+    tau_start: 0.99
+    tau_end: 0.999
+    warmup_fraction: 0.1
+
+masking:
+  context_ratio: 0.65
+
+pretraining:
+  enabled: true
+  epochs: 3
+  batch_size: 4
+  n_unlabeled: 64
+  jepa:
+    normalize_embeddings: true
+    stop_gradient_target: true
+  masking:
+    context_ratio: 0.65
+    min_block_size: 1
+    max_block_size: 4
+  physics:
+    enabled: false
+  vicreg:
+    variance_weight: 0.05
+    covariance_weight: 0.01
+  multifidelity:
+    weight: 0.5
+    enabled: true
+  optim:
+    lr: 1.5e-4
+    weight_decay: 5e-2
+    betas: [0.9, 0.95]
+  ema:
+    tau_start: 0.99
+    tau_end: 0.999
+    warmup_fraction: 0.1
+  checkpoint:
+    save_interval: 3
+    save_best: true
+
+logging:
+  base_dir: ./outputs_darcy_3d_mf
+  log_interval: 5
+  save_interval: 3

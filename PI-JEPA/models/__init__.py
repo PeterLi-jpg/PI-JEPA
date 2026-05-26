@@ -1,6 +1,6 @@
 from .pi_jepa import PIJEPA
 from .encoder import ViTEncoder, TargetEncoder, update_ema
-from .decoder import Decoder
+from .decoder import Decoder, Decoder3D
 from .predictor import Predictor, MultiStepPredictor, MultiSpeciesPredictor, ChannelMixingAttention
 from .prediction_head import PredictionHead
 from .fourier_encoder import FourierJEPAEncoder, MultiScaleFourierEncoder
@@ -14,6 +14,7 @@ __all__ = [
     "ViTEncoder",
     "TargetEncoder",
     "Decoder",
+    "Decoder3D",
     "Predictor",
     "MultiStepPredictor",
     "MultiSpeciesPredictor",

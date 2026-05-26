@@ -239,6 +239,35 @@ class Predictor(nn.Module):
 
         return z_target, stage_outputs
 
+    def forward_chained(self, z_target_in, z_context):
+        """True chained forward for operator-splitting.
+
+        Refines an existing target representation `z_target_in` conditioned
+        on the context `z_context`, WITHOUT overwriting the input with
+        mask_token. This is the variant a caller uses when chaining
+        multiple Predictor instances so each one sees the previous one's
+        output (true Lie-Trotter / Strang splitting in latent space).
+
+        Default `forward(z_full, ctx_idx, tgt_idx)` above keeps the
+        existing semantics for back-compat with callers that pass a single
+        z_full and let the predictor manage its own mask init.
+        """
+        z_target = z_target_in
+        for stage in self.stages:
+            z_delta = stage(z_target, z_context)
+            z_target = z_target + z_delta
+        return z_target
+
+    def init_mask_tokens(self, B: int, N_t: int, device, dtype=None) -> torch.Tensor:
+        """Seed a (B, N_t, D) tensor from this predictor's mask_token.
+
+        Used to initialize the chain at the first predictor (k=0).
+        """
+        z = self.mask_token.expand(B, N_t, -1).clone()
+        if dtype is not None:
+            z = z.to(dtype=dtype)
+        return z.to(device)
+
     def rollout(self, z0, steps):
         traj = []
         z = z0
