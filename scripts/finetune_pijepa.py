@@ -277,27 +277,61 @@ def train_finetune(
     lr_head: float,
     lr_encoder: float,
     freeze_encoder: bool,
+    freeze_encoder_epochs: int = 0,
 ):
-    """Fine-tune the model. encoder and decoders are optimized at different LRs."""
+    """Fine-tune the model. encoder and decoders are optimized at different LRs.
+
+    freeze_encoder           — fully freeze encoder/predictors for the entire
+                               run (existing behavior).
+    freeze_encoder_epochs N  — freeze encoder/predictors for the FIRST N
+                               epochs, then unfreeze for the remaining
+                               (epochs - N) epochs. Default 0 = no early
+                               freeze. Addresses reviewer YkpY's Open Q1:
+                               does freezing during early epochs recover
+                               the pretraining benefit at low N_l?
+    """
     model.to(device)
 
     # Build parameter groups: encoder gets a SMALLER lr, decoders get the head lr.
     encoder_params = list(model.pijepa.encoder.parameters()) + list(model.pijepa.predictors.parameters())
     head_params = list(model.decoders.parameters())
 
-    if freeze_encoder:
+    full_freeze = bool(freeze_encoder)
+    early_freeze = (not full_freeze) and (int(freeze_encoder_epochs) > 0)
+    if full_freeze or early_freeze:
         for p in encoder_params:
             p.requires_grad = False
-        param_groups = [{"params": head_params, "lr": lr_head}]
-    else:
-        param_groups = [
-            {"params": head_params, "lr": lr_head},
-            {"params": encoder_params, "lr": lr_encoder},
-        ]
-    opt = torch.optim.AdamW(param_groups, weight_decay=1e-4)
+
+    def _build_optimizer(include_encoder: bool):
+        if include_encoder:
+            pg = [
+                {"params": head_params, "lr": lr_head},
+                {"params": encoder_params, "lr": lr_encoder},
+            ]
+        else:
+            pg = [{"params": head_params, "lr": lr_head}]
+        return torch.optim.AdamW(pg, weight_decay=1e-4)
+
+    # Start optimizer over only the unfrozen params. We rebuild it later if
+    # we unfreeze mid-run (so AdamW state for encoder params is fresh, not
+    # zero — a stale optimizer over frozen params would explode on unfreeze).
+    opt = _build_optimizer(include_encoder=(not full_freeze) and (not early_freeze))
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    unfreeze_done = not early_freeze  # True if we never need to flip
 
     for epoch in range(epochs):
+        # Early-freeze handoff: at the boundary epoch, thaw the encoder and
+        # rebuild optimizer + cosine schedule over the REMAINING epochs.
+        if (not unfreeze_done) and epoch == int(freeze_encoder_epochs):
+            for p in encoder_params:
+                p.requires_grad = True
+            opt = _build_optimizer(include_encoder=True)
+            remaining = max(1, epochs - epoch)
+            sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=remaining)
+            unfreeze_done = True
+            print(f"  [freeze-encoder] thawed encoder at epoch {epoch}; "
+                  f"resuming with cosine over {remaining} remaining epochs")
+
         model.train()
         epoch_loss = 0.0
         for x, y in train_loader:
@@ -374,7 +408,12 @@ def main():
     ap.add_argument("--batch-size", type=int, default=4)
     ap.add_argument("--lr-head", type=float, default=5e-4)
     ap.add_argument("--lr-encoder", type=float, default=1e-4)
-    ap.add_argument("--freeze-encoder", action="store_true")
+    ap.add_argument("--freeze-encoder", action="store_true",
+                    help="Freeze encoder+predictors for the ENTIRE finetune.")
+    ap.add_argument("--freeze-encoder-epochs", type=int, default=0,
+                    help="Freeze encoder+predictors for the FIRST N epochs, "
+                    "then unfreeze for the remaining. Addresses reviewer "
+                    "YkpY's Open Q1 (recover pretrain benefit at low N_l).")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--output", required=True)
     args = ap.parse_args()
@@ -443,6 +482,7 @@ def main():
         model, train_loader, test_loader, device,
         epochs=args.epochs, lr_head=args.lr_head, lr_encoder=args.lr_encoder,
         freeze_encoder=args.freeze_encoder,
+        freeze_encoder_epochs=args.freeze_encoder_epochs,
     )
     dt = time.time() - t0
     metrics["wall_clock_seconds"] = dt

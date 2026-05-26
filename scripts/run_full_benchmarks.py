@@ -40,8 +40,19 @@ sys.path.insert(0, os.path.join(
 
 from utils import load_config
 from models import PredictionHead, build_encoder
-from benchmarks import FNOWrapper, DeepONetWrapper, PINOWrapper
+from benchmarks import (
+    FNOWrapper, DeepONetWrapper, PINOWrapper,
+    UFNOWrapper, UDeepONetWrapper,
+)
 from benchmarks.utils import set_seed
+
+# 3D baselines + adapter — used when train_eval_baseline sees 5D inputs.
+# Import lazily to keep module load cheap if only 2D paths are exercised.
+from benchmarks.fno_3d import FNO3D
+from benchmarks.pino_3d import PINO3D
+from benchmarks.ufno_3d import UFNO3D
+from benchmarks.pi_deeponet_3d import PIDeepONet3D, DeepONet3D
+from benchmarks.baseline_3d_adapter import BaselineAdapter3D
 
 # ============================================================================
 # Paper-specified constants
@@ -800,21 +811,109 @@ class _BaselineDL:
     def __len__(self): return len(self._ld)
 
 
-def train_eval_baseline(name, tr, te, n_l, device, seed, in_ch, out_ch):
-    set_seed(seed)
-    in_eff = 1 if name == "deeponet" else in_ch
-    out_eff = 1 if name == "deeponet" else out_ch
+def _peek_input_dim(loader):
+    """Return the spatial dimensionality of the first batch's x (4 or 5)."""
+    for batch in loader:
+        if isinstance(batch, (tuple, list)):
+            x = batch[0]
+        elif isinstance(batch, dict):
+            x = batch.get("x", batch.get(next(iter(batch))))
+        else:
+            x = batch
+        if x.dim() == 3:
+            return 4  # will be promoted to (B,1,H,W) downstream
+        return x.dim()
+    raise RuntimeError("Empty loader passed to _peek_input_dim")
 
-    if name == "fno":
-        w = FNOWrapper(device=device, in_channels=in_eff, out_channels=out_eff,
-                       modes=(16, 16), hidden_channels=64, n_layers=4)
-    elif name == "pino":
-        w = PINOWrapper(device=device, in_channels=in_eff, out_channels=out_eff,
-                        modes=(16, 16), hidden_channels=64, physics_weight=0.1)
-    elif name == "deeponet":
-        w = DeepONetWrapper(device=device)
+
+def train_eval_baseline(name, tr, te, n_l, device, seed, in_ch, out_ch,
+                        volume_shape=None):
+    """Train+eval one baseline at one (N_labeled, seed). Dispatches between
+    2D and 3D backbones based on the input rank of the first training batch.
+
+    Supported baseline names:
+      2D:  fno, pino, deeponet, ufno, u_deeponet
+      3D:  fno3d, pino3d, ufno3d, deeponet3d, pi_deeponet3d,
+           fno3d_large  (size-matched FNO ablation for qZsm M4)
+    """
+    set_seed(seed)
+    # DeepONet 2D collapses multi-channel inputs/outputs to scalar.
+    scalar_io_names = {"deeponet", "u_deeponet", "deeponet3d", "pi_deeponet3d"}
+    in_eff = 1 if name in scalar_io_names else in_ch
+    out_eff = 1 if name in scalar_io_names else out_ch
+
+    is_3d = _peek_input_dim(tr) == 5
+
+    if is_3d:
+        # Infer volume shape from first batch unless caller pinned it.
+        if volume_shape is None:
+            for batch in tr:
+                x = batch[0] if isinstance(batch, (tuple, list)) else batch["x"]
+                volume_shape = tuple(x.shape[-3:])
+                break
+
+        if name in ("fno", "fno3d"):
+            model = FNO3D(in_channels=in_eff, out_channels=out_eff,
+                          hidden_channels=32, n_blocks=4,
+                          modes=(8, 8, 8))
+            w = BaselineAdapter3D(model, device=device,
+                                  in_channels=in_eff, out_channels=out_eff,
+                                  physics_weight=0.0)
+        elif name == "fno3d_large":
+            # Size-matched FNO to address qZsm M4 (param-count confound).
+            # Aim for ~150M params: hidden=192, n_blocks=6, modes=(8,8,8).
+            model = FNO3D(in_channels=in_eff, out_channels=out_eff,
+                          hidden_channels=192, n_blocks=6,
+                          modes=(8, 8, 8))
+            w = BaselineAdapter3D(model, device=device,
+                                  in_channels=in_eff, out_channels=out_eff,
+                                  physics_weight=0.0)
+        elif name in ("pino", "pino3d"):
+            model = PINO3D(in_channels=in_eff, out_channels=out_eff,
+                           hidden_channels=32, n_blocks=4,
+                           modes=(8, 8, 8), physics_weight=0.1,
+                           residual_type="fd")
+            w = BaselineAdapter3D(model, device=device,
+                                  in_channels=in_eff, out_channels=out_eff,
+                                  physics_weight=0.1)
+        elif name in ("ufno", "ufno3d"):
+            model = UFNO3D(in_channels=in_eff, out_channels=out_eff,
+                           hidden_channels=32, n_blocks=4,
+                           modes=(8, 8, 8))
+            w = BaselineAdapter3D(model, device=device,
+                                  in_channels=in_eff, out_channels=out_eff,
+                                  physics_weight=0.0)
+        elif name in ("deeponet", "deeponet3d"):
+            model = DeepONet3D(in_channels=in_eff, out_channels=out_eff,
+                               volume_shape=volume_shape)
+            w = BaselineAdapter3D(model, device=device,
+                                  in_channels=in_eff, out_channels=out_eff,
+                                  physics_weight=0.0)
+        elif name in ("pi_deeponet", "pi_deeponet3d"):
+            model = PIDeepONet3D(in_channels=in_eff, out_channels=out_eff,
+                                 volume_shape=volume_shape,
+                                 physics_weight=0.1, residual_type="fd")
+            w = BaselineAdapter3D(model, device=device,
+                                  in_channels=in_eff, out_channels=out_eff,
+                                  physics_weight=0.1)
+        else:
+            raise ValueError(f"Unsupported 3D baseline: {name}")
     else:
-        raise ValueError(name)
+        # 2D dispatch — Brandon's original wrappers.
+        if name == "fno":
+            w = FNOWrapper(device=device, in_channels=in_eff, out_channels=out_eff,
+                           modes=(16, 16), hidden_channels=64, n_layers=4)
+        elif name == "pino":
+            w = PINOWrapper(device=device, in_channels=in_eff, out_channels=out_eff,
+                            modes=(16, 16), hidden_channels=64, physics_weight=0.1)
+        elif name == "deeponet":
+            w = DeepONetWrapper(device=device)
+        elif name == "ufno":
+            w = UFNOWrapper(device=device, in_channels=in_eff, out_channels=out_eff)
+        elif name == "u_deeponet":
+            w = UDeepONetWrapper(device=device)
+        else:
+            raise ValueError(f"Unsupported 2D baseline: {name}")
 
     w.train_model(_BaselineDL(limit(tr, n_l, seed), in_eff, out_eff),
                   epochs=300, lr=1e-3)
@@ -1380,6 +1479,14 @@ def main():
                    "resized to. Default: 32 64 64.")
     p.add_argument("--combined-pool-samples-per-epoch", type=int, default=1024,
                    help="Samples drawn per combined-pool epoch. Default 1024.")
+    p.add_argument("--baselines-2d", default=None,
+                   help="Comma-separated 2D baselines (default: "
+                   "fno,pino,deeponet,ufno,u_deeponet).")
+    p.add_argument("--baselines-3d", default=None,
+                   help="Comma-separated 3D baselines (default: "
+                   "fno3d,fno3d_large,pino3d,ufno3d,deeponet3d,pi_deeponet3d). "
+                   "Includes fno3d_large for the size-matched comparison "
+                   "(addresses qZsm M4 param-count confound).")
     p.add_argument("--ablation", action="store_true",
                    help="Run ablation study after benchmarks")
     p.add_argument("--ablation-benchmark", default="darcy",
@@ -1480,7 +1587,21 @@ def main():
     darcy_nl = [10, 25, 50, 100, 250, 500]
     adr_nl   = [10, 25, 50, 100, 250, 500]
 
-    baseline_list = ["fno", "pino", "deeponet"]
+    # Default baseline lists per dimensionality. 2D synthetic datasets keep
+    # Brandon's original wrappers; 3D real datasets get the full 3D set
+    # including the reviewer-requested PI-DeepONet (qZsm M3) and the
+    # size-matched FNO ablation (qZsm M4 confound). Overridable via CLI.
+    baseline_list_2d = (
+        args.baselines_2d.split(",") if args.baselines_2d
+        else ["fno", "pino", "deeponet", "ufno", "u_deeponet"]
+    )
+    baseline_list_3d = (
+        args.baselines_3d.split(",") if args.baselines_3d
+        else ["fno3d", "fno3d_large", "pino3d", "ufno3d",
+              "deeponet3d", "pi_deeponet3d"]
+    )
+    # Default name kept for backward compat; 2D benchmarks below pass it.
+    baseline_list = baseline_list_2d
 
     if "darcy" in args.benchmarks:
         tr, te, ic, oc = load_darcy()
@@ -1525,9 +1646,10 @@ def main():
             if tv == "P_INIT":
                 tv = "P_init"
         tr, te, ic, oc = load_ccsnet(target_var=tv)
+        # CCSNet is 3D (24x96x96) — dispatch to 3D baselines.
         all_results[bname] = run_benchmark(
             bname, config, encoders[bname], tr, te, device,
-            ic, oc, darcy_nl, baseline_list, args.n_seeds, args.output)
+            ic, oc, darcy_nl, baseline_list_3d, args.n_seeds, args.output)
         if args.domain_matched and encoders.get(bname) is not darcy_encoder:
             print(f"\n--- Cross-domain: Darcy-pretrained on {bname} ---")
             all_results[f"{bname}_crossdomain"] = run_benchmark(
@@ -1536,9 +1658,10 @@ def main():
 
     if "fno4co2" in args.benchmarks:
         tr, te, ic, oc = load_fno4co2()
+        # FNO4CO2 is 3D — dispatch to 3D baselines.
         all_results["fno4co2"] = run_benchmark(
             "fno4co2", config, encoders["fno4co2"], tr, te, device,
-            ic, oc, darcy_nl, baseline_list, args.n_seeds, args.output)
+            ic, oc, darcy_nl, baseline_list_3d, args.n_seeds, args.output)
         if args.domain_matched and encoders.get("fno4co2") is not darcy_encoder:
             print("\n--- Cross-domain comparison: Darcy-pretrained on FNO4CO2 ---")
             all_results["fno4co2_crossdomain"] = run_benchmark(
