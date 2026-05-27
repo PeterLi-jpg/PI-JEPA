@@ -22,6 +22,11 @@ set -uo pipefail
 
 PY="${PYTHON:-.venv/bin/python}"
 PIP="${PIP:-.venv/bin/pip}"
+# Resolve to ABSOLUTE paths so subshells that `cd` into a subdir don't
+# break .venv/bin/python lookups.
+if [ -x "$PY" ]; then PY="$(cd "$(dirname "$PY")" && pwd)/$(basename "$PY")"; fi
+if [ -x "$PIP" ]; then PIP="$(cd "$(dirname "$PIP")" && pwd)/$(basename "$PIP")"; fi
+echo "  PY=$PY  PIP=$PIP"
 LOG_DIR="${LOG_DIR:-/tmp}"
 mkdir -p "$LOG_DIR"
 
@@ -127,31 +132,22 @@ task_fno4co2() {
         # Wen et al. 2022 U-FNO Google Drive folder. We grab only the test
         # split (dP_test_{a,u}.pt) for the pilot — train/val are big and
         # we don't need them for the data-efficiency curve at N_l<=250.
-        cd data/fno4co2/dataset
-        for f in dP_test_a.pt dP_test_u.pt; do
-            if [ ! -s "$f" ]; then
-                echo "[fno4co2] downloading $f via gdown folder + filter..."
-                "$PY" -m gdown --folder \
-                    "https://drive.google.com/drive/folders/${UFNO_DRIVE_FOLDER}" \
-                    -O . --remaining-ok || true
-                break  # gdown --folder pulls the whole folder; one call covers both files
-            fi
-        done
-        cd ../../..
-        # Verify what we actually need is now present
+        # No `cd` here — pass absolute -O so PY/PIP relative paths still resolve.
+        echo "[fno4co2] gdown folder $UFNO_DRIVE_FOLDER → data/fno4co2/dataset/"
+        "$PY" -m gdown --folder \
+            "https://drive.google.com/drive/folders/${UFNO_DRIVE_FOLDER}" \
+            -O data/fno4co2/dataset --remaining-ok || true
         if [ -s data/fno4co2/dataset/dP_test_a.pt ] && \
            [ -s data/fno4co2/dataset/dP_test_u.pt ]; then
             echo "[fno4co2] DONE $(date)"
-            # Optionally trim the folder: keep only dP_test_*, drop the rest
-            # to save disk on a constrained Brev box.
+            # Trim non-test files to conserve disk (Brev 2× L40S has 128 GB).
             if [ "${UFNO_KEEP_ONLY_TEST:-1}" = "1" ]; then
-                cd data/fno4co2/dataset
                 for trim in sg_train_a.pt sg_train_u.pt sg_val_a.pt sg_val_u.pt \
                             sg_test_a.pt sg_test_u.pt \
                             dP_train_a.pt dP_train_u.pt dP_val_a.pt dP_val_u.pt; do
-                    [ -f "$trim" ] && rm -fv "$trim"
+                    [ -f "data/fno4co2/dataset/$trim" ] && \
+                        rm -fv "data/fno4co2/dataset/$trim"
                 done
-                cd ../../..
             fi
         else
             echo "[fno4co2] FAILED — dP_test files still missing after gdown"
