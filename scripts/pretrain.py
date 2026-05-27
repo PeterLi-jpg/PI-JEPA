@@ -576,8 +576,20 @@ class SelfSupervisedPretrainer:
         
         # Final checkpoint — skip if best already saved (save disk)
         print(f"Pretraining complete. Best checkpoint in {checkpoint_dir}")
-        
+
         best_path = os.path.join(checkpoint_dir, "checkpoint_best.pt")
+        # Some consumers (run_multiseed.py, run_ablations.py,
+        # run_focused_paper.sh) expect a `checkpoint_final.pt` artifact.
+        # Brandon's pretrainer only writes `checkpoint_best.pt` to save
+        # disk. Mirror best -> final so both names resolve to the same
+        # weights.
+        try:
+            import shutil
+            final_path = os.path.join(checkpoint_dir, "checkpoint_final.pt")
+            if os.path.exists(best_path):
+                shutil.copyfile(best_path, final_path)
+        except Exception as _e:
+            print(f"  [warn] could not mirror checkpoint_best -> _final: {_e}")
         return {
             'losses': all_losses,
             'final_loss': epoch_losses['total'],
