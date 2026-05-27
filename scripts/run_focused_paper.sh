@@ -159,16 +159,23 @@ preflight_dataset() {
     case "$DATASET" in
         darcy_3d_synthetic)
             if ! _check_file "$TRAIN_PT" || ! _check_file "$TEST_PT"; then
+                # Production-size synthetic Darcy: 1024 train / 256 test
+                # at 64^3 (matches other datasets' sample counts and the
+                # cube the encoder operates on). Generator runs ~3-5 min
+                # on CPU for this size.
+                local SYN_NTRAIN="${SYN_NTRAIN:-1024}"
+                local SYN_NTEST="${SYN_NTEST:-256}"
+                local SYN_RES="${SYN_RES:-64}"
                 if [ "$PREFLIGHT_AUTOGEN" = "1" ]; then
-                    echo "  $TRAIN_PT or $TEST_PT missing — auto-generating (~30s)..."
+                    echo "  $TRAIN_PT or $TEST_PT missing — auto-generating (~3-5 min for ${SYN_NTRAIN}+${SYN_NTEST} samples at ${SYN_RES}^3)..."
                     "$PY" scripts/generate_darcy_data_3d.py \
-                        --n-train 64 --n-test 16 --resolution 32 \
+                        --n-train "$SYN_NTRAIN" --n-test "$SYN_NTEST" --resolution "$SYN_RES" \
                         --out-dir data/darcy_3d --normalize \
                       || _preflight_fail "synthetic darcy 3D generator failed" \
-                         "Run manually: $PY scripts/generate_darcy_data_3d.py --n-train 64 --n-test 16 --resolution 32 --out-dir data/darcy_3d --normalize"
+                         "Run manually: $PY scripts/generate_darcy_data_3d.py --n-train $SYN_NTRAIN --n-test $SYN_NTEST --resolution $SYN_RES --out-dir data/darcy_3d --normalize"
                 else
                     _preflight_fail "$TRAIN_PT / $TEST_PT" \
-                      "Either set PREFLIGHT_AUTOGEN=1 (default) or run: $PY scripts/generate_darcy_data_3d.py --n-train 64 --n-test 16 --resolution 32 --out-dir data/darcy_3d --normalize"
+                      "Either set PREFLIGHT_AUTOGEN=1 (default) or run: $PY scripts/generate_darcy_data_3d.py --n-train $SYN_NTRAIN --n-test $SYN_NTEST --resolution $SYN_RES --out-dir data/darcy_3d --normalize"
                 fi
             fi
             echo "  OK: $TRAIN_PT + $TEST_PT"
