@@ -27,6 +27,21 @@
 #   BASELINES="fno3d ufno3d pino3d deeponet3d pi_deeponet3d"
 #   RESIZE_CUBE=64                  # all 5D volumes resized to NxNxN cube
 #   FREEZE_EPOCHS_PERCENT=50        # frozen-encoder ablation: pct of epochs to freeze
+#
+# Resume controls (two levels):
+#   RESUME_FROM=N                   start at phase N, skip phases 1..N-1 entirely
+#                                     phases: 1 pretrain, 2 finetune, 3 from-scratch,
+#                                     3b frozen-encoder, 4 baselines, 5 ablation, 6 figures
+#   ONLY_PHASE=N                    run ONLY phase N (mutually exclusive with RESUME_FROM)
+#   FORCE_RERUN=1                   don't skip even completed cells (re-do everything)
+#
+# Cell-level resume is automatic: each (seed, N_l, baseline) cell that already
+# wrote a valid result JSON is skipped unless FORCE_RERUN=1.
+#
+# Examples:
+#   RESUME_FROM=4 bash scripts/run_focused_paper.sh outputs/v1     # skip phases 1-3
+#   ONLY_PHASE=3b bash scripts/run_focused_paper.sh outputs/v1     # just the freeze ablation
+#   FORCE_RERUN=1 bash scripts/run_focused_paper.sh outputs/v1     # redo everything
 # =============================================================================
 
 set -euo pipefail
@@ -94,6 +109,36 @@ except Exception:
 " 2>/dev/null
 }
 
+# Phase-level resume. Two env vars give you full control:
+#   RESUME_FROM=N    Skip phases 1..(N-1) entirely. Default 1 = no skip.
+#   ONLY_PHASE=N     Run ONLY phase N, skip everything else. Mutually
+#                     exclusive with RESUME_FROM.
+# Phases:
+#   1   pretrain
+#   2   PI-JEPA finetune (sample-efficiency curve)
+#   3   PI-JEPA from scratch
+#   3b  Frozen-encoder (counts as 3.5 for ordering)
+#   4   Supervised baselines
+#   5   Ablation grid
+#   6   Figures
+RESUME_FROM="${RESUME_FROM:-1}"
+ONLY_PHASE="${ONLY_PHASE:-}"
+# Encode 3b as 3.5 internally so the numeric comparison works.
+phase_enabled() {
+    # Args: phase_num (e.g. "1", "3.5")
+    local p="$1"
+    if [ -n "$ONLY_PHASE" ]; then
+        # Normalize "3b" -> "3.5"
+        local op="${ONLY_PHASE//3b/3.5}"
+        [ "$p" = "$op" ] && return 0 || return 1
+    fi
+    # RESUME_FROM: convert "3b" -> "3.5" too
+    local r="${RESUME_FROM//3b/3.5}"
+    # awk does float comparison since bash can't
+    awk -v p="$p" -v r="$r" 'BEGIN { exit (p+0 >= r+0) ? 0 : 1 }'
+}
+echo "Resume: RESUME_FROM=$RESUME_FROM  ONLY_PHASE=${ONLY_PHASE:-<unset>}"
+
 # ---- Resolve dataset paths ----
 case "$DATASET" in
     darcy_3d_synthetic)
@@ -120,6 +165,7 @@ case "$DATASET" in
 esac
 
 # ---- (1) Pretrain PI-JEPA per seed (cached) ----
+if phase_enabled "1"; then
 echo ""
 echo "--- (1) Pretraining PI-JEPA encoder, $N_SEEDS seeds ---"
 for s in $(seq "$SEED_START" $((SEED_START + N_SEEDS - 1))); do
@@ -134,8 +180,11 @@ for s in $(seq "$SEED_START" $((SEED_START + N_SEEDS - 1))); do
         --n-seeds 1 --seed-start "$s" \
         --note "focused-paper pretrain seed $s on $DATASET"
 done
+else echo ""; echo "--- (1) Pretrain SKIPPED (RESUME_FROM=$RESUME_FROM ONLY_PHASE=${ONLY_PHASE:-}) ---"
+fi
 
 # ---- (2) PI-JEPA fine-tune × N_l × seed ----
+if phase_enabled "2"; then
 echo ""
 echo "--- (2) PI-JEPA fine-tune (sample efficiency curve) ---"
 for s in $(seq "$SEED_START" $((SEED_START + N_SEEDS - 1))); do
@@ -170,7 +219,11 @@ for s in $(seq "$SEED_START" $((SEED_START + N_SEEDS - 1))); do
     done
 done
 
+else echo ""; echo "--- (2) Finetune SKIPPED (RESUME_FROM=$RESUME_FROM ONLY_PHASE=${ONLY_PHASE:-}) ---"
+fi
+
 # ---- (3) PI-JEPA from scratch (NO pretrain) ----
+if phase_enabled "3"; then
 echo ""
 echo "--- (3) PI-JEPA from scratch (architecture-only baseline) ---"
 for s in $(seq "$SEED_START" $((SEED_START + N_SEEDS - 1))); do
@@ -204,7 +257,11 @@ for s in $(seq "$SEED_START" $((SEED_START + N_SEEDS - 1))); do
     done
 done
 
+else echo ""; echo "--- (3) Scratch SKIPPED (RESUME_FROM=$RESUME_FROM ONLY_PHASE=${ONLY_PHASE:-}) ---"
+fi
+
 # ---- (3b) PI-JEPA frozen-encoder ablation (YkpY Open Q1) ----
+if phase_enabled "3.5"; then
 echo ""
 echo "--- (3b) Frozen-encoder finetune (freeze first $FREEZE_EPOCHS epochs) ---"
 for s in $(seq "$SEED_START" $((SEED_START + N_SEEDS - 1))); do
@@ -241,7 +298,11 @@ for s in $(seq "$SEED_START" $((SEED_START + N_SEEDS - 1))); do
     done
 done
 
+else echo ""; echo "--- (3b) Frozen-encoder SKIPPED (RESUME_FROM=$RESUME_FROM ONLY_PHASE=${ONLY_PHASE:-}) ---"
+fi
+
 # ---- (4) Supervised baselines (loops over $BASELINES) ----
+if phase_enabled "4"; then
 echo ""
 echo "--- (4) Supervised baselines: $BASELINES ---"
 for baseline in $BASELINES; do
@@ -275,7 +336,11 @@ for baseline in $BASELINES; do
     done
 done
 
+else echo ""; echo "--- (4) Baselines SKIPPED (RESUME_FROM=$RESUME_FROM ONLY_PHASE=${ONLY_PHASE:-}) ---"
+fi
+
 # ---- (5) Focused 3-variant ablation at N_l = 100 (or middle of sweep) ----
+if phase_enabled "5"; then
 N_L_ABL="100"
 # Pick middle of the N_l sweep if 100 not present
 case " $N_LABELED " in
@@ -300,7 +365,11 @@ ABLATION_VARIANTS="${ABLATION_VARIANTS:-full no_chain no_physics fd_physics spec
     --n-seeds "$N_SEEDS" --seed-start "$SEED_START" \
     --variants $ABLATION_VARIANTS || true
 
+else echo ""; echo "--- (5) Ablation SKIPPED (RESUME_FROM=$RESUME_FROM ONLY_PHASE=${ONLY_PHASE:-}) ---"
+fi
+
 # ---- (6) Aggregate into paper-ready tables ----
+if phase_enabled "6"; then
 echo ""
 echo "--- (6) Generating paper-ready figures + tables ---"
 mkdir -p "$OUTPUT_ROOT/figures"
@@ -312,6 +381,9 @@ mkdir -p "$OUTPUT_ROOT/figures"
     --input-json "$OUTPUT_ROOT/ablation/ablation_table.json" \
     --metric jepa \
     --out "$OUTPUT_ROOT/figures/ablation.png" || true
+
+else echo ""; echo "--- (6) Figures SKIPPED (RESUME_FROM=$RESUME_FROM ONLY_PHASE=${ONLY_PHASE:-}) ---"
+fi
 
 echo ""
 echo "=============================================================="
