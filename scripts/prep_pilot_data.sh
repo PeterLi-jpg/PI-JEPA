@@ -134,9 +134,11 @@ task_fno4co2() {
         # we don't need them for the data-efficiency curve at N_l<=250.
         # No `cd` here — pass absolute -O so PY/PIP relative paths still resolve.
         echo "[fno4co2] gdown folder $UFNO_DRIVE_FOLDER → data/fno4co2/dataset/"
+        # gdown --folder doesn't support --remaining-ok or per-file filtering;
+        # downloads the entire folder. We trim non-test files after.
         "$PY" -m gdown --folder \
             "https://drive.google.com/drive/folders/${UFNO_DRIVE_FOLDER}" \
-            -O data/fno4co2/dataset --remaining-ok || true
+            -O data/fno4co2/dataset || true
         if [ -s data/fno4co2/dataset/dP_test_a.pt ] && \
            [ -s data/fno4co2/dataset/dP_test_u.pt ]; then
             echo "[fno4co2] DONE $(date)"
