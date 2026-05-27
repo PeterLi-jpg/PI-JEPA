@@ -148,22 +148,28 @@ class DeepONet3D(nn.Module):
         self._trunk_cache = None
 
     def _trunk_features(self, device, dtype) -> torch.Tensor:
-        """Return (DHW, latent_dim) trunk features for the configured volume."""
+        """Return (DHW, latent_dim) trunk features for the configured volume.
+
+        We cache the COORDINATES (no grad needed) and recompute `trunk(coords)`
+        on every forward. Caching the trunk OUTPUT broke autograd: the cached
+        tensor stayed in the graph across forward calls, and the second
+        backward call tried to traverse a freed graph.
+        """
+        # Cache the static coordinate grid (no grad, device/dtype-keyed).
         if (
-            self._trunk_cache is not None
-            and self._trunk_cache[0].device == device
-            and self._trunk_cache[0].dtype == dtype
+            self._trunk_cache is None
+            or self._trunk_cache[0].device != device
+            or self._trunk_cache[0].dtype != dtype
         ):
-            return self._trunk_cache[0]
-        D, H, W = self.volume_shape
-        z = torch.linspace(0.0, 1.0, D, device=device, dtype=dtype)
-        y = torch.linspace(0.0, 1.0, H, device=device, dtype=dtype)
-        x = torch.linspace(0.0, 1.0, W, device=device, dtype=dtype)
-        gz, gy, gx = torch.meshgrid(z, y, x, indexing="ij")
-        coords = torch.stack([gz, gy, gx], dim=-1).reshape(-1, 3)  # (DHW, 3)
-        feats = self.trunk(coords)  # (DHW, latent_dim)
-        self._trunk_cache = (feats,)
-        return feats
+            D, H, W = self.volume_shape
+            z = torch.linspace(0.0, 1.0, D, device=device, dtype=dtype)
+            y = torch.linspace(0.0, 1.0, H, device=device, dtype=dtype)
+            x = torch.linspace(0.0, 1.0, W, device=device, dtype=dtype)
+            gz, gy, gx = torch.meshgrid(z, y, x, indexing="ij")
+            coords = torch.stack([gz, gy, gx], dim=-1).reshape(-1, 3).detach()
+            self._trunk_cache = (coords,)
+        coords = self._trunk_cache[0]
+        return self.trunk(coords)  # (DHW, latent_dim) — fresh graph each call
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() != 5:
