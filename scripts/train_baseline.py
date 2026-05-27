@@ -46,9 +46,22 @@ sys.path.insert(0, os.path.join(os.path.dirname(HERE), "PI-JEPA"))
 from benchmarks.fno_3d import FNO3D
 from benchmarks.pino_3d import PINO3D
 from benchmarks.ufno_3d import UFNO3D
+from benchmarks.pi_deeponet_3d import DeepONet3D, PIDeepONet3D
 from eval.paper_metrics import (
     relative_l2, nrmse, max_err, conservation_residual, bootstrap_ci_95,
 )
+
+
+def _resize_cube_5d(t: torch.Tensor, side: int) -> torch.Tensor:
+    """Trilinear-resize a (N, C, D, H, W) tensor to a (N, C, side, side, side)
+    cube. Used to fit Brandon's cubic-only fourier_encoder_3d AND to give
+    every baseline the same input shape PI-JEPA sees."""
+    if t.dim() != 5:
+        raise ValueError(f"_resize_cube_5d expects 5D; got {tuple(t.shape)}")
+    if t.shape[-3:] == (side, side, side):
+        return t
+    return F.interpolate(t, size=(side, side, side),
+                         mode="trilinear", align_corners=False)
 
 
 def load_pt_dataset(pt_path: str, n_samples: int = None):
@@ -98,6 +111,7 @@ def load_ccsnet_pair(x_path: str, y_path: str, t_index: int = -1,
 
 
 def build_baseline(baseline_name: str, in_channels: int, out_channels: int,
+                   volume_shape=(64, 64, 64),
                    modes=(8, 8, 8), hidden_channels=32, n_blocks=4,
                    physics_weight: float = 0.1,
                    residual_type: str = "fd") -> nn.Module:
@@ -108,6 +122,16 @@ def build_baseline(baseline_name: str, in_channels: int, out_channels: int,
             out_channels=out_channels,
             hidden_channels=hidden_channels,
             n_blocks=n_blocks,
+            modes=modes,
+        )
+    if name == "fno3d_large":
+        # Size-matched ~150M-param FNO3D for the reviewer M4 confound.
+        # Opt in by name; default grid drops it.
+        return FNO3D(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            hidden_channels=192,
+            n_blocks=6,
             modes=modes,
         )
     if name == "ufno3d":
@@ -125,6 +149,20 @@ def build_baseline(baseline_name: str, in_channels: int, out_channels: int,
             hidden_channels=hidden_channels,
             n_blocks=n_blocks,
             modes=modes,
+            physics_weight=physics_weight,
+            residual_type=residual_type,
+        )
+    if name == "deeponet3d":
+        return DeepONet3D(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            volume_shape=tuple(volume_shape),
+        )
+    if name == "pi_deeponet3d":
+        return PIDeepONet3D(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            volume_shape=tuple(volume_shape),
             physics_weight=physics_weight,
             residual_type=residual_type,
         )
@@ -213,8 +251,15 @@ def train_supervised(
 
 def main():
     ap = argparse.ArgumentParser(description="Train a baseline operator network")
-    ap.add_argument("--baseline", required=True, choices=["fno3d", "ufno3d", "pino3d"])
+    ap.add_argument("--baseline", required=True,
+                    choices=["fno3d", "fno3d_large", "ufno3d", "pino3d",
+                             "deeponet3d", "pi_deeponet3d"])
     ap.add_argument("--dataset", required=True, choices=["darcy_3d_pt", "ccsnet"])
+    ap.add_argument("--resize-cube", type=int, default=64,
+                    help="Resize all input/output volumes to (N, N, N). "
+                    "Required because Brandon's fourier_encoder_3d is "
+                    "cubic-only; matches the cube PI-JEPA finetune sees. "
+                    "Set 0 to skip.")
     # Synthetic Darcy: --train-pt + --test-pt
     ap.add_argument("--train-pt", type=str, default=None)
     ap.add_argument("--test-pt", type=str, default=None)
@@ -252,11 +297,22 @@ def main():
     else:
         raise ValueError(args.dataset)
 
+    # Cubic resize (Brandon's fourier_encoder_3d is cubic-only; we apply
+    # the same resize to baselines so the input shape is apples-to-apples).
+    if args.resize_cube and args.resize_cube > 0:
+        side = int(args.resize_cube)
+        x_tr = _resize_cube_5d(x_tr, side)
+        y_tr = _resize_cube_5d(y_tr, side)
+        x_te = _resize_cube_5d(x_te, side)
+        y_te = _resize_cube_5d(y_te, side)
+        print(f"resized to {side}^3 cube")
+
     print(f"train shapes: x={tuple(x_tr.shape)}, y={tuple(y_tr.shape)}")
     print(f"test  shapes: x={tuple(x_te.shape)}, y={tuple(y_te.shape)}")
 
     in_channels = x_tr.shape[1]
     out_channels = y_tr.shape[1]
+    volume_shape = tuple(x_tr.shape[-3:])
 
     train_loader = DataLoader(
         TensorDataset(x_tr, y_tr),
@@ -282,11 +338,17 @@ def main():
         args.baseline,
         in_channels=in_channels,
         out_channels=out_channels,
+        volume_shape=volume_shape,
         modes=tuple(args.modes),
         hidden_channels=args.hidden_channels,
         n_blocks=args.n_blocks,
     )
-    print(f"{args.baseline} params: {sum(p.numel() for p in model.parameters()):,}")
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"{args.baseline} params: {n_params:,}")
+
+    # Peak-memory + inference-latency disclosure (reviewer qZsm M4).
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
 
     t0 = time.time()
     metrics = train_supervised(
@@ -294,12 +356,39 @@ def main():
         epochs=args.epochs, lr=args.lr,
     )
     dt = time.time() - t0
+
+    # Inference latency: timed single forward on a 1-batch test sample.
+    model.eval()
+    inf_lat_ms = None
+    try:
+        with torch.no_grad():
+            sample_x = x_te[:1].to(device)
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            t_inf0 = time.time()
+            _ = model(sample_x[:, :in_channels])
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            inf_lat_ms = (time.time() - t_inf0) * 1000.0
+    except Exception as e:
+        print(f"[warn] inference-latency measurement failed: {e}")
+
+    peak_mem_mb = None
+    if device.type == "cuda":
+        peak_mem_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+
     metrics["wall_clock_seconds"] = dt
+    metrics["param_count"] = int(n_params)
+    metrics["inference_latency_ms_batch1"] = inf_lat_ms
+    metrics["peak_gpu_memory_mb"] = peak_mem_mb
     metrics["baseline"] = args.baseline
     metrics["dataset"] = args.dataset
     metrics["n_labeled"] = args.n_labeled
     metrics["epochs"] = args.epochs
     metrics["seed"] = args.seed
+    metrics["volume_shape"] = list(volume_shape)
+    metrics["in_channels"] = int(in_channels)
+    metrics["out_channels"] = int(out_channels)
 
     out_json = os.path.join(args.output, "baseline_result.json")
     with open(out_json, "w") as f:

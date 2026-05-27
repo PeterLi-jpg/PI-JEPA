@@ -194,7 +194,7 @@ class CombinedPoolDataset(Dataset):
 
 def build_combined_pool_loader(
     tier_specs: List[Dict[str, Any]],
-    target_shape: Tuple[int, int, int] = (32, 64, 64),
+    target_shape: Tuple[int, int, int] = (64, 64, 64),
     batch_size: int = 8,
     samples_per_epoch: int = 1024,
     progressive: bool = False,
@@ -212,6 +212,12 @@ def build_combined_pool_loader(
               - "weight":      relative sampling weight (>= 0).
               - "name" (optional): label for logging.
         target_shape: common (D, H, W) every sample is trilinear-resized to.
+            Default (64,64,64) is a CUBE because Brandon's fourier_encoder_3d
+            silently squashes rectangular inputs via adaptive_avg_pool3d
+            (see audit). If you change this to a non-cubic shape, also
+            extend `models/fourier_encoder_3d.py` to accept rectangular
+            volume_size, or the encoder will produce wrong embeddings
+            without raising.
         batch_size: DataLoader batch size.
         samples_per_epoch: how many samples one "epoch" through the combined
             pool draws. Pick something comparable to a single-dataset epoch.

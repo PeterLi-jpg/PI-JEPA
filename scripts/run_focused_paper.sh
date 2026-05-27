@@ -24,6 +24,9 @@
 #   EPOCHS_PRETRAIN=500
 #   EPOCHS_FINETUNE=100
 #   EPOCHS_BASELINE=100
+#   BASELINES="fno3d ufno3d pino3d deeponet3d pi_deeponet3d"
+#   RESIZE_CUBE=64                  # all 5D volumes resized to NxNxN cube
+#   FREEZE_EPOCHS_PERCENT=50        # frozen-encoder ablation: pct of epochs to freeze
 # =============================================================================
 
 set -euo pipefail
@@ -37,6 +40,17 @@ N_LABELED="${N_LABELED:-10 25 50 100 250}"
 EPOCHS_PRETRAIN="${EPOCHS_PRETRAIN:-500}"
 EPOCHS_FINETUNE="${EPOCHS_FINETUNE:-100}"
 EPOCHS_BASELINE="${EPOCHS_BASELINE:-100}"
+# Reviewer-requested baselines. fno3d_large is the size-matched ~150M FNO
+# (qZsm M4); opt in by adding it. Defaults intentionally omit it so the
+# grid stays at the cheaper scope unless the user explicitly enables.
+BASELINES="${BASELINES:-fno3d ufno3d pino3d deeponet3d pi_deeponet3d}"
+# Cubic resize side (Brandon's fourier_encoder_3d is cubic-only). Set 0
+# to skip resize (only for synthetic Darcy3D which is already 32^3).
+RESIZE_CUBE="${RESIZE_CUBE:-64}"
+# Frozen-encoder ablation: freeze for this fraction of total finetune epochs.
+# Reviewer YkpY Open Q1.
+FREEZE_EPOCHS_PERCENT="${FREEZE_EPOCHS_PERCENT:-50}"
+FREEZE_EPOCHS=$(( EPOCHS_FINETUNE * FREEZE_EPOCHS_PERCENT / 100 ))
 
 export PYTORCH_ENABLE_MPS_FALLBACK=1
 mkdir -p "$OUTPUT_ROOT"
@@ -50,7 +64,16 @@ echo "  N_l    : $N_LABELED"
 echo "  pretrain epochs : $EPOCHS_PRETRAIN"
 echo "  finetune epochs : $EPOCHS_FINETUNE"
 echo "  baseline epochs : $EPOCHS_BASELINE"
+echo "  baselines       : $BASELINES"
+echo "  resize cube     : ${RESIZE_CUBE}^3"
+echo "  freeze epochs   : $FREEZE_EPOCHS  ($FREEZE_EPOCHS_PERCENT%)"
 echo "=============================================================="
+
+# Common --resize-cube arg for finetune; empty if RESIZE_CUBE=0
+RESIZE_FLAG=""
+if [ "$RESIZE_CUBE" -gt 0 ]; then
+    RESIZE_FLAG="--resize-cube $RESIZE_CUBE"
+fi
 
 # ---- Resolve dataset paths ----
 case "$DATASET" in
@@ -108,7 +131,7 @@ for s in $(seq "$SEED_START" $((SEED_START + N_SEEDS - 1))); do
                 --dataset "$FT_DATASET" \
                 --train-x "$TRAIN_X" --train-y "$TRAIN_Y" \
                 --test-x "$TEST_X"   --test-y "$TEST_Y" \
-                --resize-to 96 96 \
+                $RESIZE_FLAG \
                 --n-labeled "$n_l" --epochs "$EPOCHS_FINETUNE" --seed "$s" \
                 --output "$OUT" || true
         else
@@ -117,6 +140,7 @@ for s in $(seq "$SEED_START" $((SEED_START + N_SEEDS - 1))); do
                 --pretrain-config "$PRETRAIN_CONFIG" \
                 --dataset "$FT_DATASET" \
                 --train-pt "$TRAIN_PT" --test-pt "$TEST_PT" \
+                $RESIZE_FLAG \
                 --n-labeled "$n_l" --epochs "$EPOCHS_FINETUNE" --seed "$s" \
                 --output "$OUT" || true
         fi
@@ -137,7 +161,7 @@ for s in $(seq "$SEED_START" $((SEED_START + N_SEEDS - 1))); do
                 --dataset "$FT_DATASET" \
                 --train-x "$TRAIN_X" --train-y "$TRAIN_Y" \
                 --test-x "$TEST_X"   --test-y "$TEST_Y" \
-                --resize-to 96 96 \
+                $RESIZE_FLAG \
                 --n-labeled "$n_l" --epochs "$EPOCHS_FINETUNE" --seed "$s" \
                 --output "$OUT" || true
         else
@@ -146,35 +170,73 @@ for s in $(seq "$SEED_START" $((SEED_START + N_SEEDS - 1))); do
                 --pretrain-config "$PRETRAIN_CONFIG" \
                 --dataset "$FT_DATASET" \
                 --train-pt "$TRAIN_PT" --test-pt "$TEST_PT" \
+                $RESIZE_FLAG \
                 --n-labeled "$n_l" --epochs "$EPOCHS_FINETUNE" --seed "$s" \
                 --output "$OUT" || true
         fi
     done
 done
 
-# ---- (4) Supervised FNO3D baseline ----
+# ---- (3b) PI-JEPA frozen-encoder ablation (YkpY Open Q1) ----
 echo ""
-echo "--- (4) FNO3D supervised baseline ---"
+echo "--- (3b) Frozen-encoder finetune (freeze first $FREEZE_EPOCHS epochs) ---"
 for s in $(seq "$SEED_START" $((SEED_START + N_SEEDS - 1))); do
+    CKPT="$OUTPUT_ROOT/pretrain/seed${s}/pretrain/checkpoint_final.pt"
     for n_l in $N_LABELED; do
-        OUT="$OUTPUT_ROOT/fno3d_baseline/seed${s}_n${n_l}"
+        OUT="$OUTPUT_ROOT/pijepa_frozen/seed${s}_n${n_l}"
         mkdir -p "$OUT"
         if [ "$DATASET" = "ccsnet" ]; then
-            "$PY" scripts/train_baseline.py \
-                --baseline fno3d --dataset ccsnet \
+            "$PY" scripts/finetune_pijepa.py \
+                --pretrain-checkpoint "$CKPT" \
+                --pretrain-config "$PRETRAIN_CONFIG" \
+                --dataset "$FT_DATASET" \
                 --train-x "$TRAIN_X" --train-y "$TRAIN_Y" \
                 --test-x "$TEST_X"   --test-y "$TEST_Y" \
-                --n-labeled "$n_l" --epochs "$EPOCHS_BASELINE" --seed "$s" \
-                --hidden-channels 32 --n-blocks 4 --modes 4 8 8 \
+                $RESIZE_FLAG \
+                --freeze-encoder-epochs "$FREEZE_EPOCHS" \
+                --n-labeled "$n_l" --epochs "$EPOCHS_FINETUNE" --seed "$s" \
                 --output "$OUT" || true
         else
-            "$PY" scripts/train_baseline.py \
-                --baseline fno3d --dataset darcy_3d_pt \
+            "$PY" scripts/finetune_pijepa.py \
+                --pretrain-checkpoint "$CKPT" \
+                --pretrain-config "$PRETRAIN_CONFIG" \
+                --dataset "$FT_DATASET" \
                 --train-pt "$TRAIN_PT" --test-pt "$TEST_PT" \
-                --n-labeled "$n_l" --epochs "$EPOCHS_BASELINE" --seed "$s" \
-                --hidden-channels 32 --n-blocks 4 --modes 8 8 8 \
+                $RESIZE_FLAG \
+                --freeze-encoder-epochs "$FREEZE_EPOCHS" \
+                --n-labeled "$n_l" --epochs "$EPOCHS_FINETUNE" --seed "$s" \
                 --output "$OUT" || true
         fi
+    done
+done
+
+# ---- (4) Supervised baselines (loops over $BASELINES) ----
+echo ""
+echo "--- (4) Supervised baselines: $BASELINES ---"
+for baseline in $BASELINES; do
+    for s in $(seq "$SEED_START" $((SEED_START + N_SEEDS - 1))); do
+        for n_l in $N_LABELED; do
+            OUT="$OUTPUT_ROOT/baselines/${baseline}/seed${s}_n${n_l}"
+            mkdir -p "$OUT"
+            if [ "$DATASET" = "ccsnet" ]; then
+                "$PY" scripts/train_baseline.py \
+                    --baseline "$baseline" --dataset ccsnet \
+                    --train-x "$TRAIN_X" --train-y "$TRAIN_Y" \
+                    --test-x "$TEST_X"   --test-y "$TEST_Y" \
+                    --resize-cube "$RESIZE_CUBE" \
+                    --n-labeled "$n_l" --epochs "$EPOCHS_BASELINE" --seed "$s" \
+                    --hidden-channels 32 --n-blocks 4 --modes 8 8 8 \
+                    --output "$OUT" || true
+            else
+                "$PY" scripts/train_baseline.py \
+                    --baseline "$baseline" --dataset darcy_3d_pt \
+                    --train-pt "$TRAIN_PT" --test-pt "$TEST_PT" \
+                    --resize-cube "$RESIZE_CUBE" \
+                    --n-labeled "$n_l" --epochs "$EPOCHS_BASELINE" --seed "$s" \
+                    --hidden-channels 32 --n-blocks 4 --modes 8 8 8 \
+                    --output "$OUT" || true
+            fi
+        done
     done
 done
 
@@ -188,12 +250,20 @@ case " $N_LABELED " in
         ;;
 esac
 echo ""
-echo "--- (5) Ablation (full / no_chain / no_physics) at N_l=$N_L_ABL ---"
+echo "--- (5) Ablation (full grid: 7 variants × $N_SEEDS seeds at N_l=$N_L_ABL) ---"
+# Each variant changes pretraining (own pretrain + finetune); reviewer-traceable.
+# - full: reference
+# - no_chain: num_predictors=1 (operator-split contribution — M2)
+# - no_physics: pretrain without physics residual (M1, W1)
+# - fd_physics vs spectral_physics: which residual implementation helps (Q2)
+# - no_vicreg: VICReg contribution (M2)
+# - no_per_stage_decoders: per-stage decoder contribution
+ABLATION_VARIANTS="${ABLATION_VARIANTS:-full no_chain no_physics fd_physics spectral_physics no_vicreg no_per_stage_decoders}"
 "$PY" scripts/run_ablations.py \
     --base-config "$PRETRAIN_CONFIG" \
     --output "$OUTPUT_ROOT/ablation" \
     --n-seeds "$N_SEEDS" --seed-start "$SEED_START" \
-    --variants full no_chain no_physics || true
+    --variants $ABLATION_VARIANTS || true
 
 # ---- (6) Aggregate into paper-ready tables ----
 echo ""

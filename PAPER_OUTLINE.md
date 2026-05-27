@@ -8,6 +8,47 @@
 
 ---
 
+## Branch and code-hygiene notes (audit findings, permanent record)
+
+Brandon shipped 26 new files in `upstream/fourier-jepa` (the revision branch).
+A code audit found which are safe to use:
+
+**Safe and wired** (use as-is): `models/brooks_corey_conditioner.py`,
+`models/pvt_conditioner.py`, `training/curriculum.py`,
+`training/learned_weights.py`, `physics/spectral_residual.py` (only
+when `H == W == self.resolution`), `data/irregular_grid.py` (NaN-fill only),
+`training/multi_fidelity.py` (sampler utility only, wired via
+`data/combined_pool.py`).
+
+**Safe but orphan** (real code, must invoke manually): `benchmarks/pod_baseline.py`
+(steady-state only; `rollout()` is fake), `eval/uq_ensemble.py`,
+`scripts/generate_{spe10,compositional,real_field,sgs_corpus}_data.py`,
+`scripts/download_data.py`.
+
+**DO NOT USE** (audit found bugs / dead code):
+- `models/fourier_encoder_3d.py` — **cubic-only**, rectangular inputs silently
+  squashed via `adaptive_avg_pool3d`. Workaround: resize everything to a cube
+  (we use `64³`).
+- `physics/latent_flux.py` — loss is minimized when all patch embeddings are
+  identical → representation collapse. Documented in its docstring.
+- `physics/tpfa.py` — 2D pressure-only despite "3D" framing; insufficient for
+  the 3D Darcy claim.
+- `models/well_conditioner.py` — wired in `pretrainer.py:582-583` but
+  `batch.get('well_controls')` always returns None on every existing dataset.
+  Dead-by-data.
+- `training/adaptive_collocation.py` — `sample()` never called; inert.
+- `scripts/figures/*.py` (six scripts) — all fall back to synthetic data;
+  use `scripts/make_paper_figures.py` instead.
+- `eval/optimization.py` — random search labeled as optimization; fake
+  timing.
+
+The "cubic-only encoder" is the most critical: any pipeline configured for
+rectangular volumes will produce **silently wrong** embeddings (no error).
+All our scripts that touch the encoder pass `--resize-cube 64` to enforce
+the cube.
+
+---
+
 ## Focused thesis (one sentence)
 
 > PI-JEPA — pretrained on **free unlabeled** parameter fields with a **true

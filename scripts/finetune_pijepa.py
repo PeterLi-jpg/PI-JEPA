@@ -400,6 +400,10 @@ def main():
     ap.add_argument("--test-y", type=str, default=None)
     ap.add_argument("--resize-to", type=int, nargs=2, default=None,
                     help="Optional (H, W) resize for CCSNet/FNO4CO2")
+    ap.add_argument("--resize-cube", type=int, default=0,
+                    help="If >0, trilinear-resize all input/output volumes "
+                    "to (N, N, N). Required for Brandon's cubic-only "
+                    "fourier_encoder_3d. Typical: 64.")
     ap.add_argument("--fno4co2-variant", type=str, default="dP",
                     choices=["dP", "sg"])
     ap.add_argument("--n-labeled", type=int, default=32)
@@ -453,6 +457,22 @@ def main():
     else:
         raise ValueError(args.dataset)
 
+    # Cubic resize for the encoder (Brandon's fourier_encoder_3d is cubic-only).
+    if args.resize_cube and args.resize_cube > 0:
+        side = int(args.resize_cube)
+        def _to_cube(t):
+            if t.dim() != 5:
+                return t
+            if t.shape[-3:] == (side, side, side):
+                return t
+            return F.interpolate(t, size=(side, side, side),
+                                 mode="trilinear", align_corners=False)
+        x_tr = _to_cube(x_tr)
+        y_tr = _to_cube(y_tr)
+        x_te = _to_cube(x_te)
+        y_te = _to_cube(y_te)
+        print(f"resized to {side}^3 cube (encoder cubic-only)")
+
     print(f"train shapes: x={tuple(x_tr.shape)}, y={tuple(y_tr.shape)}")
     print(f"test  shapes: x={tuple(x_te.shape)}, y={tuple(y_te.shape)}")
 
@@ -466,7 +486,15 @@ def main():
             args.pretrain_checkpoint, config, device
         )
     model = PIJEPAFinetuner(pijepa, decoders)
-    print(f"PI-JEPA finetuner params: {sum(p.numel() for p in model.parameters()):,}")
+    # Component-wise param breakdown (reviewer qZsm M4 — original disclosure
+    # only reported encoder; total is 150-250M including predictors/decoders).
+    n_encoder = sum(p.numel() for p in pijepa.encoder.parameters())
+    n_predictors = sum(p.numel() for p in pijepa.predictors.parameters())
+    n_decoders = sum(p.numel() for p in decoders.parameters())
+    n_total = n_encoder + n_predictors + n_decoders
+    print(f"PI-JEPA finetuner params: total={n_total:,}  "
+          f"(encoder={n_encoder:,}, predictors={n_predictors:,}, "
+          f"decoders={n_decoders:,})")
 
     train_loader = DataLoader(
         TensorDataset(x_tr, y_tr),
@@ -477,6 +505,9 @@ def main():
         batch_size=args.batch_size, shuffle=False, num_workers=0,
     )
 
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+
     t0 = time.time()
     metrics = train_finetune(
         model, train_loader, test_loader, device,
@@ -485,12 +516,40 @@ def main():
         freeze_encoder_epochs=args.freeze_encoder_epochs,
     )
     dt = time.time() - t0
+
+    # Inference latency on one test sample (reviewer qZsm M4).
+    model.eval()
+    inf_lat_ms = None
+    try:
+        with torch.no_grad():
+            sx = x_te[:1].to(device)
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            t_inf0 = time.time()
+            _ = model(sx)
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            inf_lat_ms = (time.time() - t_inf0) * 1000.0
+    except Exception as e:
+        print(f"[warn] inference-latency measurement failed: {e}")
+
+    peak_mem_mb = None
+    if device.type == "cuda":
+        peak_mem_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+
     metrics["wall_clock_seconds"] = dt
+    metrics["param_count_total"] = int(n_total)
+    metrics["param_count_encoder"] = int(n_encoder)
+    metrics["param_count_predictors"] = int(n_predictors)
+    metrics["param_count_decoders"] = int(n_decoders)
+    metrics["inference_latency_ms_batch1"] = inf_lat_ms
+    metrics["peak_gpu_memory_mb"] = peak_mem_mb
     metrics["method"] = "pi_jepa_from_scratch" if args.from_scratch else "pi_jepa_finetuned"
     metrics["dataset"] = args.dataset
     metrics["n_labeled"] = args.n_labeled
     metrics["epochs"] = args.epochs
     metrics["seed"] = args.seed
+    metrics["freeze_encoder_epochs"] = int(args.freeze_encoder_epochs)
     metrics["pretrain_checkpoint"] = None if args.from_scratch else args.pretrain_checkpoint
 
     out_json = os.path.join(args.output, "pijepa_result.json")
