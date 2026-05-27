@@ -27,7 +27,10 @@ mkdir -p "$LOG_DIR"
 
 # Public IDs / URLs from the dataset README files / Brandon's download_data.py.
 CCSNET_DRIVE_FOLDER="1SVZFkaxkAIjcGKew3rzGTmKW5tSBUGf7"
-FNO4CO2_REPO="https://github.com/gegewen/fno4co2.git"
+# "FNO4CO2" in the task list is Wen et al. 2022 U-FNO dataset; the
+# `dP_test_a.pt` filename we already have locally matches their layout.
+# Public Google Drive folder (not Dropbox as the task description said):
+UFNO_DRIVE_FOLDER="1fZQfMn_vsjKUXAfRV0q_gswtl8JEkVGo"
 
 echo "============================================================"
 echo "  prep_pilot_data: launching 4 parallel acquisitions"
@@ -115,27 +118,46 @@ task_fno4co2() {
             echo "[fno4co2] already present — skip"
             return 0
         fi
-        mkdir -p data/fno4co2
-        if [ ! -d data/fno4co2/repo ]; then
-            git clone --quiet "$FNO4CO2_REPO" data/fno4co2/repo
+        # Ensure gdown installed (shared with ccsnet task — both may install in parallel)
+        if ! "$PY" -c 'import gdown' 2>/dev/null; then
+            echo "[fno4co2] installing gdown..."
+            "$PIP" install --quiet gdown
         fi
-        cd data/fno4co2/repo
-        # The repo ships a download.sh that pulls dataset from Dropbox.
-        if [ -x download.sh ]; then
-            bash download.sh
-        elif [ -x scripts/download.sh ]; then
-            bash scripts/download.sh
+        mkdir -p data/fno4co2/dataset
+        # Wen et al. 2022 U-FNO Google Drive folder. We grab only the test
+        # split (dP_test_{a,u}.pt) for the pilot — train/val are big and
+        # we don't need them for the data-efficiency curve at N_l<=250.
+        cd data/fno4co2/dataset
+        for f in dP_test_a.pt dP_test_u.pt; do
+            if [ ! -s "$f" ]; then
+                echo "[fno4co2] downloading $f via gdown folder + filter..."
+                "$PY" -m gdown --folder \
+                    "https://drive.google.com/drive/folders/${UFNO_DRIVE_FOLDER}" \
+                    -O . --remaining-ok || true
+                break  # gdown --folder pulls the whole folder; one call covers both files
+            fi
+        done
+        cd ../../..
+        # Verify what we actually need is now present
+        if [ -s data/fno4co2/dataset/dP_test_a.pt ] && \
+           [ -s data/fno4co2/dataset/dP_test_u.pt ]; then
+            echo "[fno4co2] DONE $(date)"
+            # Optionally trim the folder: keep only dP_test_*, drop the rest
+            # to save disk on a constrained Brev box.
+            if [ "${UFNO_KEEP_ONLY_TEST:-1}" = "1" ]; then
+                cd data/fno4co2/dataset
+                for trim in sg_train_a.pt sg_train_u.pt sg_val_a.pt sg_val_u.pt \
+                            sg_test_a.pt sg_test_u.pt \
+                            dP_train_a.pt dP_train_u.pt dP_val_a.pt dP_val_u.pt; do
+                    [ -f "$trim" ] && rm -fv "$trim"
+                done
+                cd ../../..
+            fi
         else
-            echo "[fno4co2] no download.sh found in repo — manual fetch needed"
-            ls -la
+            echo "[fno4co2] FAILED — dP_test files still missing after gdown"
+            ls -la data/fno4co2/dataset/
             exit 1
         fi
-        cd ../../..
-        # Move dataset to expected location if needed
-        if [ ! -d data/fno4co2/dataset ] && [ -d data/fno4co2/repo/dataset ]; then
-            ln -sfn ../repo/dataset data/fno4co2/dataset
-        fi
-        echo "[fno4co2] DONE $(date)"
     } > "$log" 2>&1
 }
 
