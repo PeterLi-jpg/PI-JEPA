@@ -123,6 +123,161 @@ except Exception:
 #   6   Figures
 RESUME_FROM="${RESUME_FROM:-1}"
 ONLY_PHASE="${ONLY_PHASE:-}"
+
+# =============================================================================
+# Preflight dataset check. Run at startup BEFORE any phase. For the chosen
+# DATASET, verifies all required input files exist. If missing, EITHER
+# auto-generates them (cheap synthetic data) OR exits with a clear,
+# actionable error pointing at the manual fetch the user needs to do.
+#
+# Set PREFLIGHT_AUTOGEN=0 to disable auto-generation and just fail.
+# =============================================================================
+
+PREFLIGHT_AUTOGEN="${PREFLIGHT_AUTOGEN:-1}"
+
+_preflight_fail() {
+    echo ""
+    echo "================================================================"
+    echo "  PREFLIGHT FAILED: dataset=$DATASET"
+    echo "================================================================"
+    echo "  Missing: $1"
+    echo ""
+    echo "  Action needed:"
+    echo "$2" | sed 's/^/    /'
+    echo "================================================================"
+    exit 2
+}
+
+_check_file() {
+    [ -s "$1" ] || return 1
+    return 0
+}
+
+preflight_dataset() {
+    echo ""
+    echo "--- Preflight: verifying $DATASET inputs ---"
+    case "$DATASET" in
+        darcy_3d_synthetic)
+            if ! _check_file "$TRAIN_PT" || ! _check_file "$TEST_PT"; then
+                if [ "$PREFLIGHT_AUTOGEN" = "1" ]; then
+                    echo "  $TRAIN_PT or $TEST_PT missing — auto-generating (~30s)..."
+                    "$PY" scripts/generate_darcy_data_3d.py \
+                        --n-train 64 --n-test 16 --resolution 32 \
+                        --out-dir data/darcy_3d --normalize \
+                      || _preflight_fail "synthetic darcy 3D generator failed" \
+                         "Run manually: $PY scripts/generate_darcy_data_3d.py --n-train 64 --n-test 16 --resolution 32 --out-dir data/darcy_3d --normalize"
+                else
+                    _preflight_fail "$TRAIN_PT / $TEST_PT" \
+                      "Either set PREFLIGHT_AUTOGEN=1 (default) or run: $PY scripts/generate_darcy_data_3d.py --n-train 64 --n-test 16 --resolution 32 --out-dir data/darcy_3d --normalize"
+                fi
+            fi
+            echo "  OK: $TRAIN_PT + $TEST_PT"
+            ;;
+        ccsnet)
+            for path in "$TRAIN_X" "$TRAIN_Y" "$TEST_X" "$TEST_Y"; do
+                if ! _check_file "$path"; then
+                    _preflight_fail "$path" \
+                      "CCSNet must be downloaded from its Google Drive folder.
+The required HDF5 files live under data/ccsnet/CCSNet_v1.0/.
+- test_x.hdf5            (input fields)
+- test_y_SG.hdf5         (saturation target — used for the default pilot)
+- test_y_{BPR,BXMF,BYMF,BDENW,BDENG,P_init}.hdf5 (other variants, optional)
+On Brev, try: $PY scripts/download_data.py --ccsnet
+Or use Brandon's gdown wrapper: bash scripts/download_supervisor.sh ccsnet
+If gdown fails, click the README link in https://github.com/gegewen/ccsnet"
+                fi
+            done
+            echo "  OK: CCSNet input + target files present"
+            ;;
+        fno4co2)
+            if ! _check_file "$TRAIN_X" || ! _check_file "$TRAIN_Y"; then
+                _preflight_fail "$TRAIN_X / $TRAIN_Y" \
+                  "FNO4CO2 must be downloaded from its Dropbox link.
+On Brev:
+  git clone https://github.com/gegewen/fno4co2 data/fno4co2/repo
+  cd data/fno4co2/repo && bash download.sh
+The init script downloads dP_test_a.pt + dP_test_u.pt to data/fno4co2/dataset/"
+            fi
+            echo "  OK: FNO4CO2 dP_test_a.pt + dP_test_u.pt present"
+            ;;
+        adr_pe_da)
+            local train_pt="data/pdebench_adr/adr_train.pt"
+            local test_pt="data/pdebench_adr/adr_test.pt"
+            local h5="data/pdebench_adr/pe_da_sweep.h5"
+            if ! _check_file "$train_pt" || ! _check_file "$test_pt"; then
+                if _check_file "$h5"; then
+                    echo "  $h5 present but .pt not yet converted — converting..."
+                    "$PY" scripts/convert_adr_to_pt.py \
+                        --input "$h5" --out-dir data/pdebench_adr \
+                        --train-frac 0.8 --normalize \
+                      || _preflight_fail "ADR .pt converter failed" \
+                         "Run: $PY scripts/convert_adr_to_pt.py --input $h5 --out-dir data/pdebench_adr --train-frac 0.8 --normalize"
+                elif [ "$PREFLIGHT_AUTOGEN" = "1" ]; then
+                    echo "  $h5 missing — generating sweep (~20 min)..."
+                    "$PY" scripts/generate_adr_pe_da_sweep.py \
+                        --n-pe 8 --n-da 8 --n-per-cell 16 \
+                        --pe-range 0.1 30 --da-range 0.1 30 \
+                        --grid 64 --t-final 0.5 --n-t 16 \
+                        --output "$h5" \
+                      || _preflight_fail "ADR Pe/Da generator failed" \
+                         "Manual: $PY scripts/generate_adr_pe_da_sweep.py --output $h5"
+                    "$PY" scripts/convert_adr_to_pt.py \
+                        --input "$h5" --out-dir data/pdebench_adr \
+                        --train-frac 0.8 --normalize \
+                      || _preflight_fail "ADR convert failed after generate" ""
+                else
+                    _preflight_fail "$train_pt / $test_pt + $h5" \
+                      "Either run the generator + converter (see scripts/generate_adr_pe_da_sweep.py),
+or set PREFLIGHT_AUTOGEN=1 to do it automatically (~20 min)."
+                fi
+            fi
+            echo "  OK: data/pdebench_adr/adr_train.pt + adr_test.pt"
+            ;;
+        fourier_mionet)
+            _preflight_fail "data/fourier_mionet/data/" \
+              "Fourier-MIONet requires a manual OneDrive download (no public direct URL).
+1. Click: https://yaleedu-my.sharepoint.com/:f:/g/personal/lu_lu_yale_edu/EvWUGDhKje1MsNAtatoxCHsB6qYDyNTpWxDhz_Kf_N7i-Q
+2. Sign in with a Yale account or as a guest if the share permits.
+3. Download the data folder as a ZIP.
+4. Extract to data/fourier_mionet/data/."
+            ;;
+        newwell)
+            if ! command -v flow >/dev/null 2>&1; then
+                _preflight_fail "OPM Flow simulator (no 'flow' on PATH)" \
+                  "OPM Flow is needed to generate the New-Well dataset.
+On Brev: bash scripts/setup_opm_flow.sh
+On Mac:  no clean install — use Brev or Docker"
+            fi
+            if ! _check_file "data/spe10/spe10_arrays.npz"; then
+                _preflight_fail "data/spe10/spe10_arrays.npz" \
+                  "SPE10 not parsed. Run:
+1. mkdir -p data/spe10 && curl -sSL -o data/spe10/por_perm_case2a.zip 'https://www.spe.org/web/csp/datasets/por_perm_case2a.zip'
+2. cd data/spe10 && unzip por_perm_case2a.zip
+3. $PY scripts/load_spe10.py --spe10-dir data/spe10 --out data/spe10/spe10_arrays.npz"
+            fi
+            if [ ! -d "data/newwell_spe10" ] || [ -z "$(ls data/newwell_spe10 2>/dev/null)" ]; then
+                if [ "$PREFLIGHT_AUTOGEN" = "1" ]; then
+                    echo "  data/newwell_spe10 missing — generating (~30 CPU-hours, sit back)..."
+                    "$PY" scripts/generate_newwell_dataset.py \
+                        --spe10-arrays data/spe10/spe10_arrays.npz \
+                        --n-wells 500 --out-dir data/newwell_spe10 --n-workers 4 \
+                      || _preflight_fail "OPM Flow new-well generator failed" \
+                         "Inspect data/newwell_spe10/run_results.json for per-sim errors."
+                else
+                    _preflight_fail "data/newwell_spe10/" \
+                      "Run: $PY scripts/generate_newwell_dataset.py --spe10-arrays data/spe10/spe10_arrays.npz --n-wells 500 --out-dir data/newwell_spe10"
+                fi
+            fi
+            echo "  OK: SPE10 arrays + new-well sims present"
+            ;;
+        *)
+            _preflight_fail "unknown dataset name" \
+              "Supported: darcy_3d_synthetic, ccsnet, fno4co2, adr_pe_da, fourier_mionet, newwell.
+Add a new case to preflight_dataset() in scripts/run_focused_paper.sh."
+            ;;
+    esac
+    echo "--- Preflight OK ---"
+}
 # Encode 3b as 3.5 internally so the numeric comparison works.
 phase_enabled() {
     # Args: phase_num (e.g. "1", "3.5")
@@ -158,11 +313,35 @@ case "$DATASET" in
         TEST_Y="data/ccsnet/CCSNet_v1.0/test_y_SG.hdf5"
         FT_DATASET="ccsnet"
         ;;
+    fno4co2)
+        PRETRAIN_CONFIG="configs/fno4co2_lite_3d_smoke.yaml"
+        TRAIN_X="data/fno4co2/dataset/dP_test_a.pt"
+        TRAIN_Y="data/fno4co2/dataset/dP_test_u.pt"
+        TEST_X="data/fno4co2/dataset/dP_test_a.pt"
+        TEST_Y="data/fno4co2/dataset/dP_test_u.pt"
+        FT_DATASET="fno4co2"
+        ;;
+    adr_pe_da)
+        PRETRAIN_CONFIG="configs/darcy_3d.yaml"  # same 3D shape (1, 16, 64, 64)
+        TRAIN_PT="data/pdebench_adr/adr_train.pt"
+        TEST_PT="data/pdebench_adr/adr_test.pt"
+        FT_DATASET="darcy_3d_pt"  # uses the same loader path as synthetic Darcy
+        ;;
+    fourier_mionet|newwell)
+        # Both have dataset-specific quirks; preflight prints actionable
+        # download / generation instructions and exits if missing.
+        PRETRAIN_CONFIG="configs/darcy_3d.yaml"
+        ;;
     *)
         echo "Unknown dataset: $DATASET"
+        echo "Supported: darcy_3d_synthetic, ccsnet, fno4co2, adr_pe_da, fourier_mionet, newwell"
         exit 2
         ;;
 esac
+
+# Run preflight check NOW (before any phase). Fail-fast with actionable
+# instructions if a required input is missing AND not auto-generable.
+preflight_dataset
 
 # ---- (1) Pretrain PI-JEPA per seed (cached) ----
 if phase_enabled "1"; then
