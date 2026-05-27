@@ -1125,15 +1125,31 @@ def build_model_for_pretraining(
         p.requires_grad = False
     target_encoder.load_state_dict(encoder.state_dict())
     
-    # Build decoder
+    # Build decoder — dispatch 3D when encoder is 3D, else 2D Decoder.
     decoder_cfg = config.get("decoder", {})
-    decoder = Decoder(
-        embed_dim=decoder_cfg.get("embed_dim", config["model"]["encoder"]["embed_dim"]),
-        out_channels=decoder_cfg.get("out_channels", 1),
-        image_size=decoder_cfg.get("image_size", config["model"]["encoder"]["image_size"]),
-        patch_size=decoder_cfg.get("patch_size", config["model"]["encoder"]["patch_size"])
-    ).to(device)
-    
+    enc_image_size = config["model"]["encoder"]["image_size"]
+    enc_patch_size = config["model"]["encoder"]["patch_size"]
+    if dim_3d:
+        from ..models import Decoder3D
+        # 3D image_size: prefer encoder.volume_size if set, else fall back to
+        # image_size (cubic). Decoder3D handles rectangular lists too.
+        vol_size = enc_cfg.get("volume_size", enc_image_size)
+        decoder = Decoder3D(
+            embed_dim=decoder_cfg.get("embed_dim",
+                                      config["model"]["encoder"]["embed_dim"]),
+            out_channels=decoder_cfg.get("out_channels", 1),
+            image_size=decoder_cfg.get("image_size", vol_size),
+            patch_size=decoder_cfg.get("patch_size", enc_patch_size),
+        ).to(device)
+    else:
+        decoder = Decoder(
+            embed_dim=decoder_cfg.get("embed_dim",
+                                      config["model"]["encoder"]["embed_dim"]),
+            out_channels=decoder_cfg.get("out_channels", 1),
+            image_size=decoder_cfg.get("image_size", enc_image_size),
+            patch_size=decoder_cfg.get("patch_size", enc_patch_size),
+        ).to(device)
+
     return model, decoder
 
 

@@ -662,34 +662,110 @@ def build_model_for_pretraining(
     return model, decoder
 
 
+class _Simple3DUnlabeledDataset(torch.utils.data.Dataset):
+    """Minimal 3D unlabeled-fields dataset that reads our `.pt` format.
+
+    Expects `<path>/darcy3d_train.pt` (or `_pretrain.pt`) with a dict
+    `{"x": (N, C, D, H, W), "y": ...}`. Returns `{"x": (C, D, H, W)}` dicts
+    so the pretrainer's existing 5D-aware forward path consumes it.
+
+    Brandon's `UnlabeledDarcyDataset` is hardcoded 2D (returns `(1, H, W)`)
+    and silently mis-stacks our 3D `.pt` files. We dispatch to this loader
+    whenever `config.data.ndim == 3` or `config.model.encoder.type == 'fourier_3d'`.
+    """
+
+    def __init__(self, path: str, split: str = "pretrain",
+                 n_samples: Optional[int] = None, normalize: bool = True,
+                 resize_cube: Optional[int] = None):
+        import os
+        candidates = [
+            os.path.join(path, "darcy3d_train.pt"),
+            os.path.join(path, "darcy3d_pretrain.pt"),
+            os.path.join(path, "train.pt"),
+        ]
+        chosen = None
+        for c in candidates:
+            if os.path.exists(c):
+                chosen = c
+                break
+        if chosen is None:
+            raise FileNotFoundError(
+                f"_Simple3DUnlabeledDataset: no recognizable 3D .pt under {path}; "
+                f"tried: {candidates}"
+            )
+        blob = torch.load(chosen, weights_only=False, map_location="cpu")
+        x = blob["x"].float()  # (N, C, D, H, W)
+        if x.dim() != 5:
+            raise ValueError(
+                f"Expected 5D (N, C, D, H, W) tensor in {chosen}; got {tuple(x.shape)}"
+            )
+        if n_samples is not None and n_samples > 0:
+            x = x[:n_samples]
+        if resize_cube and x.shape[-3:] != (resize_cube,) * 3:
+            x = torch.nn.functional.interpolate(
+                x, size=(resize_cube,) * 3, mode="trilinear", align_corners=False
+            )
+        if normalize:
+            mean = x.mean()
+            std = x.std() + 1e-8
+            x = (x - mean) / std
+        self.x = x
+        self.split = split
+
+    def __len__(self):
+        return self.x.shape[0]
+
+    def __getitem__(self, idx):
+        return {"x": self.x[idx]}
+
+
 def build_unlabeled_dataloader(
     config: Dict[str, Any],
     split: str = "pretrain"
 ) -> DataLoader:
     """
     Build data loader for unlabeled coefficient fields.
-    
+
+    Dispatches to a 3D-aware dataset when `config.data.ndim == 3` or when
+    the encoder is `fourier_3d`. Brandon's original `UnlabeledDarcyDataset`
+    is 2D-only and silently mis-stacks 3D `.pt` files, producing
+    `(B, 4, 1, 16, 16)`-shaped tensors that crash the 3D encoder.
+
     Args:
         config: Configuration dictionary
         split: Data split ('train', 'pretrain', 'test')
-        
+
     Returns:
         DataLoader for unlabeled coefficient fields
     """
     pretraining_cfg = config.get("pretraining", {})
     data_cfg = config.get("data", {})
-    
-    dataset_config = {
-        'path': data_cfg.get("path", ""),
-        'n_samples': pretraining_cfg.get("n_unlabeled", 1000),
-        'resolution': data_cfg.get("grid_size", 64),
-        'normalize': data_cfg.get("normalize", True)
-    }
-    
-    dataset = UnlabeledDarcyDataset(config=dataset_config, split=split)
-    
-    batch_size = pretraining_cfg.get("batch_size", config.get("training", {}).get("batch_size", 64))
-    
+    model_cfg = config.get("model", {})
+    enc_cfg = model_cfg.get("encoder", {})
+
+    is_3d = (data_cfg.get("ndim") == 3) or (enc_cfg.get("type") == "fourier_3d")
+    batch_size = pretraining_cfg.get("batch_size",
+                                     config.get("training", {}).get("batch_size", 64))
+
+    if is_3d:
+        # 3D: load our `.pt` blob directly and resize to encoder cube.
+        vol_size = enc_cfg.get("volume_size", data_cfg.get("grid_size", 32))
+        dataset = _Simple3DUnlabeledDataset(
+            path=data_cfg.get("path", "data/darcy_3d"),
+            split=split,
+            n_samples=pretraining_cfg.get("n_unlabeled", None),
+            normalize=data_cfg.get("normalize", True),
+            resize_cube=int(vol_size),
+        )
+    else:
+        dataset_config = {
+            'path': data_cfg.get("path", ""),
+            'n_samples': pretraining_cfg.get("n_unlabeled", 1000),
+            'resolution': data_cfg.get("grid_size", 64),
+            'normalize': data_cfg.get("normalize", True),
+        }
+        dataset = UnlabeledDarcyDataset(config=dataset_config, split=split)
+
     return DataLoader(
         dataset,
         batch_size=batch_size,
