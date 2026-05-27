@@ -570,9 +570,21 @@ class SelfSupervisedPretrainer:
                     os.path.join(checkpoint_dir, "checkpoint_best.pt"),
                     optimizer, epoch_losses
                 )
-            
-            # Periodic checkpoint — only save best to conserve disk
-            # (epoch checkpoints disabled to avoid filling disk during ablations)
+
+            # Periodic safety checkpoint — overwrites a single
+            # `checkpoint_latest.pt` every N epochs so a crash at epoch
+            # K loses at most N epochs of work (vs losing all work after
+            # the last `best_loss` improvement). Default N=25; tune via
+            # `pretraining.checkpoint_interval` in the config. Single
+            # rotating file (not per-epoch) keeps disk usage bounded.
+            ckpt_interval = int(
+                self.config.get("pretraining", {}).get("checkpoint_interval", 25)
+            )
+            if ckpt_interval > 0 and ((epoch + 1) % ckpt_interval == 0):
+                self._save_checkpoint(
+                    os.path.join(checkpoint_dir, "checkpoint_latest.pt"),
+                    optimizer, epoch_losses
+                )
         
         # Final checkpoint — skip if best already saved (save disk)
         print(f"Pretraining complete. Best checkpoint in {checkpoint_dir}")

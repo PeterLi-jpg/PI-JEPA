@@ -75,6 +75,25 @@ if [ "$RESIZE_CUBE" -gt 0 ]; then
     RESIZE_FLAG="--resize-cube $RESIZE_CUBE"
 fi
 
+# Skip-if-done helper: returns 0 (skip) if RESULT_PATH exists, non-empty,
+# and is a valid JSON containing a relative_l2_mean (i.e. a completed
+# run). Otherwise returns 1 (run it). Set FORCE_RERUN=1 to bypass.
+skip_if_done() {
+    local result_path="$1"
+    if [ "${FORCE_RERUN:-0}" = "1" ]; then
+        return 1
+    fi
+    [ ! -s "$result_path" ] && return 1
+    "$PY" -c "
+import json, sys
+try:
+    d = json.load(open('$result_path'))
+    sys.exit(0 if 'relative_l2_mean' in d else 1)
+except Exception:
+    sys.exit(1)
+" 2>/dev/null
+}
+
 # ---- Resolve dataset paths ----
 case "$DATASET" in
     darcy_3d_synthetic)
@@ -124,6 +143,10 @@ for s in $(seq "$SEED_START" $((SEED_START + N_SEEDS - 1))); do
     for n_l in $N_LABELED; do
         OUT="$OUTPUT_ROOT/pijepa_finetune/seed${s}_n${n_l}"
         mkdir -p "$OUT"
+        if skip_if_done "$OUT/pijepa_result.json"; then
+            echo "  [seed $s n_l=$n_l] cached: $OUT/pijepa_result.json"
+            continue
+        fi
         if [ "$DATASET" = "ccsnet" ]; then
             "$PY" scripts/finetune_pijepa.py \
                 --pretrain-checkpoint "$CKPT" \
@@ -154,6 +177,10 @@ for s in $(seq "$SEED_START" $((SEED_START + N_SEEDS - 1))); do
     for n_l in $N_LABELED; do
         OUT="$OUTPUT_ROOT/pijepa_scratch/seed${s}_n${n_l}"
         mkdir -p "$OUT"
+        if skip_if_done "$OUT/pijepa_result.json"; then
+            echo "  [scratch seed $s n_l=$n_l] cached"
+            continue
+        fi
         if [ "$DATASET" = "ccsnet" ]; then
             "$PY" scripts/finetune_pijepa.py \
                 --from-scratch \
@@ -185,6 +212,10 @@ for s in $(seq "$SEED_START" $((SEED_START + N_SEEDS - 1))); do
     for n_l in $N_LABELED; do
         OUT="$OUTPUT_ROOT/pijepa_frozen/seed${s}_n${n_l}"
         mkdir -p "$OUT"
+        if skip_if_done "$OUT/pijepa_result.json"; then
+            echo "  [frozen seed $s n_l=$n_l] cached"
+            continue
+        fi
         if [ "$DATASET" = "ccsnet" ]; then
             "$PY" scripts/finetune_pijepa.py \
                 --pretrain-checkpoint "$CKPT" \
@@ -218,6 +249,10 @@ for baseline in $BASELINES; do
         for n_l in $N_LABELED; do
             OUT="$OUTPUT_ROOT/baselines/${baseline}/seed${s}_n${n_l}"
             mkdir -p "$OUT"
+            if skip_if_done "$OUT/baseline_result.json"; then
+                echo "  [$baseline seed $s n_l=$n_l] cached"
+                continue
+            fi
             if [ "$DATASET" = "ccsnet" ]; then
                 "$PY" scripts/train_baseline.py \
                     --baseline "$baseline" --dataset ccsnet \
