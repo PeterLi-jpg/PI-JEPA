@@ -669,15 +669,34 @@ def build_model_for_pretraining(
         p.requires_grad = False
     target_encoder.load_state_dict(encoder.state_dict())
     
-    # Build decoder
+    # Build decoder — dispatch 3D when encoder type is fourier_3d, else 2D.
+    # Brandon's original code always built 2D Decoder; this mismatched the
+    # 3D encoder build_encoder picks up via type=fourier_3d, producing
+    # state dicts with proj.weight shape (out_ch * patch_size^2, embed)
+    # that fail to load into Decoder3D (which expects (out_ch * pd*ph*pw)).
     decoder_cfg = config.get("decoder", {})
-    decoder = Decoder(
-        embed_dim=decoder_cfg.get("embed_dim", config["model"]["encoder"]["embed_dim"]),
-        out_channels=decoder_cfg.get("out_channels", 1),  # Single channel for pretraining
-        image_size=decoder_cfg.get("image_size", config["model"]["encoder"]["image_size"]),
-        patch_size=decoder_cfg.get("patch_size", config["model"]["encoder"]["patch_size"])
-    ).to(device)
-    
+    enc_cfg = config.get("model", {}).get("encoder", {})
+    is_3d = (
+        config.get("data", {}).get("ndim") == 3
+        or enc_cfg.get("type") == "fourier_3d"
+    )
+    if is_3d:
+        from models import Decoder3D
+        vol_size = enc_cfg.get("volume_size", enc_cfg.get("image_size", 32))
+        decoder = Decoder3D(
+            embed_dim=decoder_cfg.get("embed_dim", enc_cfg.get("embed_dim", 256)),
+            out_channels=decoder_cfg.get("out_channels", 1),
+            image_size=decoder_cfg.get("image_size", vol_size),
+            patch_size=decoder_cfg.get("patch_size", enc_cfg.get("patch_size", 4)),
+        ).to(device)
+    else:
+        decoder = Decoder(
+            embed_dim=decoder_cfg.get("embed_dim", enc_cfg.get("embed_dim", 256)),
+            out_channels=decoder_cfg.get("out_channels", 1),
+            image_size=decoder_cfg.get("image_size", enc_cfg.get("image_size", 64)),
+            patch_size=decoder_cfg.get("patch_size", enc_cfg.get("patch_size", 8)),
+        ).to(device)
+
     return model, decoder
 
 
