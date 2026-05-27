@@ -292,7 +292,14 @@ class SelfSupervisedPretrainer:
         # AC 1.3: Apply spatial masking to partition coefficient field
         # Handle padded indices (-1) and clamp to valid range
         target_idx_safe = target_idx.clamp(min=0, max=num_patches - 1)
-        x_masked = self.model.mask_input(x, target_idx_safe)
+        # Dispatch 4D vs 5D masking. Brandon's mask_input is 2D-only
+        # (B, C, H, W); mask_input_nd routes to the 3D variant when x is
+        # 5D (B, C, D, H, W). Without this, 3D pretrain crashes with
+        # "too many values to unpack (expected 4)" inside the 2D mask_input.
+        if hasattr(self.model, "mask_input_nd"):
+            x_masked = self.model.mask_input_nd(x, target_idx_safe)
+        else:
+            x_masked = self.model.mask_input(x, target_idx_safe)
         
         # Encode masked input with context encoder
         # AC 1.4: Context_Encoder processes only context patches
