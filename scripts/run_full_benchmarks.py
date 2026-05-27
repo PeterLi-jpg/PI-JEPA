@@ -1673,9 +1673,12 @@ def main():
     )
     baseline_list_3d = (
         args.baselines_3d.split(",") if args.baselines_3d
-        else ["fno3d", "fno3d_large", "pino3d", "ufno3d",
-              "deeponet3d", "pi_deeponet3d"]
+        else ["fno3d", "pino3d", "ufno3d", "deeponet3d", "pi_deeponet3d"]
     )
+    # fno3d_large (size-matched ~150M FNO) is still implemented in
+    # train_eval_baseline but excluded from the default grid; opt in via
+    # --baselines-3d fno3d,fno3d_large,... if you want to address qZsm M4
+    # head-on. param_counts.json still discloses the gap.
     # Default name kept for backward compat; 2D benchmarks below pass it.
     baseline_list = baseline_list_2d
 
