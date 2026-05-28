@@ -18,12 +18,12 @@ experiment:
 data:
   dataset: darcy_3d
   path: data/darcy_3d
-  grid_size: 32          # cubic side length (D = H = W = 32)
+  grid_size: 64          # cubic side length (D = H = W = 64) — matches pilot cube
   ndim: 3
   sequence_length: 1
   stride: 1
   normalize: true
-  num_patches: 512       # (32/4)^3 = 8^3 = 512
+  num_patches: 512       # (64/8)^3 = 8^3 = 512 — patch_size bumped to 8
   channels:
     u: 0
     k: 1
@@ -39,8 +39,9 @@ model:
   encoder:
     type: fourier_3d
     embed_dim: 256
-    patch_size: 4
-    image_size: 32
+    patch_size: 8           # 64/8=8 → 8^3 = 512 patches (matches data cube)
+    image_size: 64
+    volume_size: 64         # explicit cubic volume_size for fourier_encoder_3d
     depth: 6
     heads: 8
     mlp_ratio: 4.0
@@ -71,8 +72,8 @@ model:
 decoder:
   embed_dim: 256
   out_channels: 1
-  image_size: 32
-  patch_size: 4
+  image_size: 64
+  patch_size: 8
 
 physics:
   type: darcy_3d

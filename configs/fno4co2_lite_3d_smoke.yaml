@@ -19,8 +19,8 @@ data:
   dataset: fno4co2
   path: data/fno4co2/dataset/lite_dataset
   ndim: 3
-  grid_size: 96
-  num_patches: 864
+  grid_size: 64
+  num_patches: 512   # (64/8)^3 = 512 — cubic to match encoder
   normalize: true
   channels:
     u: 0
@@ -46,8 +46,9 @@ model:
   encoder:
     type: fourier_3d
     embed_dim: 192
-    image_size: [24, 96, 96]
-    patch_size: [4, 8, 8]
+    image_size: 64
+    volume_size: 64
+    patch_size: 8
     depth: 6
     heads: 8
     mlp_ratio: 4.0
@@ -70,8 +71,8 @@ model:
 decoder:
   embed_dim: 192
   out_channels: 1
-  image_size: [24, 96, 96]
-  patch_size: [4, 8, 8]
+  image_size: 64
+  patch_size: 8
   per_stage: true
 
 physics:

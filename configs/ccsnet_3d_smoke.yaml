@@ -20,8 +20,8 @@ data:
   dataset: ccsnet
   path: data/ccsnet/CCSNet_v1.0
   ndim: 3
-  grid_size: 96
-  num_patches: 864   # gd*gh*gw = 6*12*12
+  grid_size: 64
+  num_patches: 512   # (64/8)^3 = 512 — cubic to match fourier_encoder_3d (cubic-only)
   normalize: true
   channels:
     u: 0
@@ -42,8 +42,9 @@ model:
   encoder:
     type: fourier_3d
     embed_dim: 192
-    image_size: [24, 96, 96]    # (T, H, W)
-    patch_size: [4, 8, 8]       # token grid = (6, 12, 12) = 864
+    image_size: 64              # cubic — fourier_encoder_3d is cubic-only per audit
+    volume_size: 64             # explicit
+    patch_size: 8               # token grid = (8, 8, 8) = 512
     depth: 6
     heads: 8
     mlp_ratio: 4.0
@@ -66,8 +67,8 @@ model:
 decoder:
   embed_dim: 192
   out_channels: 1
-  image_size: [24, 96, 96]
-  patch_size: [4, 8, 8]
+  image_size: 64
+  patch_size: 8
   per_stage: true
 
 physics:
